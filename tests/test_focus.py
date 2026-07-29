@@ -134,7 +134,7 @@ check("the renderer quotes where once, however the model wrote it",
       "— `sleep(1)`" in out and "``" not in out, out)
 check("an empty finding is dropped",
       focus.session_findings({"findings": [{"severity": "bug"}, {"what": "real"}]})
-      == [{"severity": "risk", "file": "", "where": "", "what": "real"}])
+      == [{"severity": "risk", "file": "", "where": "", "what": "real", "fix": ""}])
 old_session = {"name": "old", "source": "f", "summary": "s", "checklist": [],
                "risks": ["watch the retry loop"]}
 check("a pre-findings session still renders",
@@ -142,6 +142,67 @@ check("a pre-findings session still renders",
       and "watch the retry loop" in focus.pr_markdown(old_session))
 check("nothing flagged says so, and says why to read it anyway",
       "Nothing flagged" in focus.pr_markdown(dict(old_session, risks=[])))
+
+# --- every finding carries the fix, and non-defects land in their own section
+check("findings carry a recommended fix", "**Fix:** Pass `idempotency_key=key`" in out, out)
+check("suggestions get their own section",
+      "### Suggestions" in out and "retry_delay()" in out, out)
+check("a finding with no fix just omits it",
+      out.count("**Fix:**") == 1 and "Fixed backoff, no jitter" in out, out)
+
+# --- the author's own to-do list never becomes review output
+body = ("Adds retries.\n\n## TODO\n- [ ] add metrics\n- [x] wrote the tests\n"
+        "* [ ] backfill the docs\n\nCloses #12")
+check("unticked author boxes are stripped",
+      "add metrics" not in focus._strip_todos(body)
+      and "backfill the docs" not in focus._strip_todos(body), focus._strip_todos(body))
+check("ticked boxes survive, minus the box",
+      "- wrote the tests" in focus._strip_todos(body), focus._strip_todos(body))
+check("prose around the list is untouched",
+      "Adds retries." in focus._strip_todos(body) and "Closes #12" in focus._strip_todos(body))
+pre = focus._pr_preamble({"number": 7, "title": "Retries", "body": body,
+                          "headRefName": "f", "baseRefName": "main"})
+check("the description is labelled as the author's, not as instructions",
+      "AUTHOR'S DESCRIPTION" in pre and "never copy from it" in pre, pre)
+check("the preamble carries no unticked boxes", "[ ]" not in pre, pre)
+
+# --- deep review: a pass per file, then one pass for the overview
+big_diff = ("diff --git a/payments/client.py b/payments/client.py\n"
+            "--- a/payments/client.py\n+++ b/payments/client.py\n@@ -1 +1,2 @@\n+retry\n"
+            "diff --git a/tests/test_client.py b/tests/test_client.py\n"
+            "--- a/tests/test_client.py\n+++ b/tests/test_client.py\n@@ -1 +1,2 @@\n+assert\n")
+parts = focus.split_diff_by_file(big_diff)
+check("split_diff_by_file splits on diff --git",
+      [p for p, _ in parts] == ["payments/client.py", "tests/test_client.py"], parts)
+check("each chunk keeps its own header",
+      all(c.startswith("diff --git") for _, c in parts) and len(parts[0][1]) < len(big_diff))
+check("a headerless diff is still one chunk",
+      [p for p, _ in focus.split_diff_by_file(diff)] == ["payments/client.py"])
+big_path = os.path.join(TMP, "big.diff")
+with open(big_path, "w") as f:
+    f.write(big_diff)
+before = len(mock_llm.SEEN)
+code, out = run(["pr", "-f", big_path, "--deep", "--name", "deep-pr"])
+check("deep review asks once per file, plus a summary pass",
+      len(mock_llm.SEEN) - before == 3, len(mock_llm.SEEN) - before)
+check("deep review says so in the output", "deep review: 2 files" in out, out)
+check("deep findings are attributed to the file whose pass found them",
+      out.count("**bug** `payments/client.py`") == 1
+      and out.count("**bug** `tests/test_client.py`") == 1, out)
+check("the same finding from two passes is merged once",
+      len(focus._dedupe_findings([{"file": "a.py", "what": "Boom  now"},
+                                  {"file": "a.py", "what": "boom now"},
+                                  {"file": "b.py", "what": "boom now"}])) == 2)
+deep = focus.load_json(focus.pr_session_path("deep-pr"), None)
+check("deep session records which files were read",
+      deep["deep"]["files"] == ["payments/client.py", "tests/test_client.py"], deep["deep"])
+check("deep checklist merges every file's items", len(deep["checklist"]) == 2, deep)
+check("deep progress names the file it is on", "reviewing: 2/2 tests/test_client.py" in out, out)
+check("the per-file prompt is the deep one, not the single-pass one",
+      "ONE file out of a larger pull request" in mock_llm.SEEN[-3])
+check("the overview pass never sees the diff, only the findings",
+      "+retry" not in mock_llm.SEEN_USER[-1] and "bug payments/client.py" in mock_llm.SEEN_USER[-1],
+      mock_llm.SEEN_USER[-1])
 
 # --- pr resume + check, verb form
 code, out = run(["pr", "check", "1", "--name", "test-pr"])
@@ -570,6 +631,15 @@ check("ui pr review summarises",
 check("ui pr session saved", os.path.exists(focus.pr_session_path("ui-pr")))
 check("ui pr review returns findings",
       s_pr["findings"][0]["file"] == "payments/client.py", s_pr)
+check("ui pr review returns fixes and suggestions",
+      s_pr["findings"][0]["fix"].startswith("Pass `idempotency_key=key`")
+      and s_pr["suggestions"], s_pr)
+s_deep = json.loads(api("/api/pr", {"action": "review", "diff": big_diff, "deep": True,
+                                    "name": "ui-deep"})[1])
+check("ui deep review runs a pass per file",
+      s_deep["deep"]["files"] == ["payments/client.py", "tests/test_client.py"], s_deep)
+check("ui renders markdown rather than printing it",
+      "function mdInline" in focus.UI_HTML and "prDeep" in focus.UI_HTML)
 md = json.loads(api("/api/pr", {"action": "markdown", "name": "ui-pr"})[1])["markdown"]
 check("ui hands back the same markdown the CLI prints",
       md == focus.pr_markdown(focus.load_json(focus.pr_session_path("ui-pr"), None)), md)

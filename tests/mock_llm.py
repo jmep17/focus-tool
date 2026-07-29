@@ -37,15 +37,35 @@ def canned_reply(messages):
             {"text": "Read the last 3 CI failure logs for the pattern", "estimate_min": 15},
             {"text": "Write the fix and re-run locally 5 times", "estimate_min": 25},
         ]})
-    if "unified diff" in system:
+    # the deep-review prompts first: they are the specific case, SYS_PR is the general one
+    if "ONE file out of a larger pull request" in system:
         return json.dumps({
-            "summary": "Adds retry logic to the payment client and covers it with tests.",
             "findings": [
                 {"severity": "bug", "file": "payments/client.py",
                  "where": "for attempt in range(3):",
-                 "what": "Retry loop could double-charge if idempotency key is missing"},
+                 "what": "Retry loop could double-charge if idempotency key is missing",
+                 "fix": "Pass `idempotency_key=key` into every retried request"},
+            ],
+            "checklist": [
+                {"file": "payments/client.py", "item": "Run the retry test 5 times"},
+            ],
+        })
+    if "already been reviewed on its own" in system:
+        return json.dumps({
+            "summary": "Adds retry logic to the payment client and covers it with tests.",
+            "suggestions": ["Pull the backoff into `retry_delay()` so it can be tested"],
+        })
+    if "unified diff" in system:
+        return json.dumps({
+            "summary": "Adds retry logic to the payment client and covers it with tests.",
+            "suggestions": ["Consider a shared `retry_delay()` helper"],
+            "findings": [
+                {"severity": "bug", "file": "payments/client.py",
+                 "where": "for attempt in range(3):",
+                 "what": "Retry loop could double-charge if idempotency key is missing",
+                 "fix": "Pass `idempotency_key=key` into every retried request"},
                 {"severity": "nit", "file": "payments/client.py",
-                 "where": "`sleep(1)`", "what": "Fixed backoff, no jitter"},
+                 "where": "`sleep(1)`", "what": "Fixed backoff, no jitter", "fix": ""},
             ],
             "checklist": [
                 {"file": "payments/client.py", "item": "Verify idempotency key is sent on retries"},

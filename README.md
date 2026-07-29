@@ -125,20 +125,31 @@ focus pr                 # your staged/unstaged changes — or, if the tree is
                          # clean, this branch's own PR, pulled for you
 focus pr fetch           # always this branch's PR
 focus pr fetch 4600      # ...or that one
+focus pr --deep          # one model pass per changed file, then a summary pass
 focus pr resume          # after ANY interruption: shows "<- you are here"
 focus pr check 3         # tick item 3 as reviewed
 ```
 
 You get **findings first**: concrete problems quoted out of the diff, each tagged
-`bug` / `risk` / `nit`, worst first — then a 3-sentence summary of what the change
-does, then a checklist of the things only a human can check by running the code.
+`bug` / `risk` / `nit`, worst first, **each with the fix it would make** — then a
+3-sentence summary, any suggestions that aren't defects, then a checklist of the
+things only a human can check by running the code.
 Zero findings is an allowed answer; the prompt would rather say nothing than pad.
+Your own PR description is context, never review material: unticked checkboxes are
+stripped out of it, so a review never hands you back your own to-do list.
 Your position in the checklist is saved on disk, so a meeting or a Slack ping
 can't wipe your mental state — the checklist *is* the state.
 
 The whole review is markdown, so it reads well in the terminal and pastes
 straight into the PR. The dashboard's **copy as markdown** button asks the server
 for the same text `focus pr` prints, rather than re-rendering it in the browser.
+
+**`focus pr --deep`** (and the dashboard's *deep* checkbox) reviews each changed
+file in its own model call, then writes the overview from the findings. Depth on a
+local model comes from the number of passes, not from asking nicely: 60k characters
+in one request gets skimmed, the same diff in seven gets read. It costs a pass per
+file — minutes, not seconds — so it's a flag, not the default. Above 12 files it
+stops and names the ones it skipped.
 
 How good the findings are tracks the model. A 7B model gives you a reading aid; a
 32B coder model gives you review notes. Either way it is a first pass, not a

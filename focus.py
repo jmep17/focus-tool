@@ -318,18 +318,71 @@ Rules:
 - severity is exactly one of: "bug" (wrong behaviour), "risk" (works today, will
   bite later), "nit" (naming, style, dead code).
 - Never comment on code that is not in the diff. Never invent a file or a line.
+- fix: for every finding, the concrete change you would make. Name the edit, don't
+  describe the goal — "pass idempotency_key=key into the retry", not "handle keys
+  correctly". A one-line code snippet in `backticks` is ideal. Say "not sure" only
+  when you genuinely cannot suggest one.
+- suggestions: improvements that are NOT defects — a simpler shape, a name that
+  would carry better, a test worth having. Nothing that duplicates a finding. Zero
+  is fine.
 - checklist is only what a human has to check by running the code or reading AROUND
   the diff — the things you cannot verify from the diff alone. One or two per
   changed file, ordered so related files sit together. Do not pad.
-- Inside "summary", "what" and "item", write markdown: `backticks` around
-  identifiers, paths and values. No headings, no bullets, no code fences.
+- If the author's description contains a task list, a TODO list or unticked boxes,
+  those are THEIR notes to themselves. Never copy them into the checklist, the
+  findings or the suggestions. Review the code, not the author's to-do list.
+- Inside "summary", "what", "fix", "item" and suggestions, write markdown:
+  `backticks` around identifiers, paths and values. No headings, no bullets, no
+  code fences.
 - "file" and "where" are plain text — no backticks, no markdown. They get quoted
   for you.
 Reply with ONLY this JSON:
 {"summary": "3 short sentences max: what this change does and why",
  "findings": [{"severity": "bug", "file": "path", "where": "the line or symbol",
-               "what": "what is wrong, and when it bites"}],
+               "what": "what is wrong, and when it bites",
+               "fix": "the change you would make"}],
+ "suggestions": ["an improvement that is not a defect"],
  "checklist": [{"file": "path", "item": "one specific thing to verify in this file"}]}"""
+
+SYS_PR_FILE = """You are reviewing ONE file out of a larger pull request, closely.
+You get the whole diff for that one file, so there is no excuse for skimming: read
+every changed line and say what is wrong with it.
+Rules:
+- findings are concrete problems in THIS file's diff. Each quotes the line or symbol
+  it is about, says in one sentence what breaks and when, and gives the fix you would
+  make (name the edit, not the goal).
+- Look for, at least: off-by-one and boundary errors, unhandled error paths and
+  exceptions, None/null and empty-collection cases, resource leaks, ordering and
+  concurrency, state mutated while iterated, silent exception swallowing, changed
+  behaviour the callers of this function will not expect, and anything the
+  surrounding code's conventions say should have been done differently.
+- severity is exactly one of: "bug" (wrong behaviour), "risk" (works today, will
+  bite later), "nit" (naming, style, dead code).
+- Zero findings is a respectable answer for a clean file. Never pad.
+- Never comment on code that is not in this diff. Never invent a line.
+- If the author's description contains a task list or unticked boxes, ignore it
+  entirely — it is their notes, not your review.
+- checklist: at most 2 things a human must check by running the code or reading
+  around this diff. Often zero.
+- markdown `backticks` inside "what", "fix" and "item"; "where" stays plain.
+Reply with ONLY this JSON:
+{"findings": [{"severity": "bug", "file": "path", "where": "the line or symbol",
+               "what": "what is wrong, and when it bites",
+               "fix": "the change you would make"}],
+ "checklist": [{"file": "path", "item": "one specific thing to verify"}]}"""
+
+SYS_PR_SUMMARY = """Every file in this pull request has already been reviewed on its own.
+You are given the change's description and the findings that came back from those
+passes. Write the overview a reviewer reads first.
+Rules:
+- summary: 3 short sentences max — what this change does and why, across all files.
+- suggestions: improvements that are NOT defects and do not repeat a finding —
+  a simpler shape, a better name, a test worth having. Zero is fine. Never copy
+  anything out of the author's own task list or TODOs.
+- Do not restate the findings. Do not invent new ones.
+- markdown `backticks` around identifiers and paths.
+Reply with ONLY this JSON:
+{"summary": "...", "suggestions": ["..."]}"""
 
 SYS_DRAFT = """You help a developer with ADHD write work messages. They will give you
 rough bullets or a half-written draft. Produce a ready-to-send message.
@@ -1739,13 +1792,111 @@ def _pr_preamble(meta):
     if not meta:
         return ""
     head = f"PULL REQUEST #{meta.get('number')}: {meta.get('title', '')}".strip()
-    body = _clip((meta.get("body") or "").strip(), MAX_PR_BODY_CHARS)
+    body = _clip(_strip_todos((meta.get("body") or "").strip()), MAX_PR_BODY_CHARS)
     branch, base = meta.get("headRefName", ""), meta.get("baseRefName", "")
     line = f"{branch} -> {base}" if branch and base else ""
+    if body:
+        body = ("AUTHOR'S DESCRIPTION (their words, context only — never review it, "
+                "never copy from it):\n" + body)
     return "\n".join(x for x in (head, line, body) if x) + "\n\nDIFF:\n"
 
+_TODO_RE = re.compile(r"^\s*[-*+]\s*\[( |x|X)\]\s*")
+
+def _strip_todos(body):
+    """Take the author's task list out of the PR description. An unticked box is work
+    they haven't done yet — feed it to a model and it comes back as a review item, which
+    is how a review ends up handing someone their own to-do list. Ticked boxes describe
+    what the PR *did*, so those stay, minus the checkbox that makes them look tickable."""
+    out = []
+    for raw in body.splitlines():
+        m = _TODO_RE.match(raw)
+        if not m:
+            out.append(raw)
+        elif m.group(1) in ("x", "X"):
+            out.append("- " + raw[m.end():])
+    return "\n".join(out).strip()
+
+MAX_DEEP_FILES = 12          # a per-file pass each; past this it stops being one sitting
+MAX_DEEP_FILE_CHARS = 24_000  # one file's diff, before its share of context is charged
+
+def split_diff_by_file(diff):
+    """[(path, that file's diff)] in diff order. Splits on `diff --git`, which is the
+    only boundary git guarantees — hunk headers appear inside a file's diff too."""
+    starts = [m.start() for m in re.finditer(r"^diff --git ", diff, re.M)]
+    if not starts:
+        paths = diff_paths(diff)
+        return [(paths[0] if paths else "?", diff)] if diff.strip() else []
+    starts.append(len(diff))
+    out = []
+    for i in range(len(starts) - 1):
+        chunk = diff[starts[i]:starts[i + 1]]
+        paths = diff_paths(chunk)
+        out.append((paths[0] if paths else "?", chunk))
+    return out
+
+def _dedupe_key(*parts):
+    return tuple(" ".join(str(p).lower().split()) for p in parts)
+
+def _dedupe_findings(findings):
+    """Per-file passes never see each other, so a change threaded through five files
+    comes back as the same finding five times. Same file and same sentence is the same
+    finding; the first one wins, since findings arrive worst-first within a file."""
+    seen, out = set(), []
+    for f in findings:
+        k = _dedupe_key(f["file"], f["what"])
+        if k not in seen:
+            seen.add(k)
+            out.append(f)
+    return out
+
+def _dedupe_checklist(items):
+    seen, out = set(), []
+    for c in items:
+        k = _dedupe_key(c.get("file", ""), c.get("item", ""))
+        if k not in seen:
+            seen.add(k)
+            out.append(c)
+    return out
+
+def run_deep_review(diff, ctx, ticket, preamble, say):
+    """One model pass per changed file, then one pass over the findings for the summary.
+
+    This is what depth costs on a local model: a 60k-char diff in one request gets
+    skimmed, the same diff in seven requests gets read. Returns the same dict shape the
+    single-pass reply has, so run_pr_review stores it without caring which way it came."""
+    files = split_diff_by_file(diff)
+    skipped = files[MAX_DEEP_FILES:]
+    files = files[:MAX_DEEP_FILES]
+    sys_file = SYS_PR_FILE + project_block(ctx) + ticket_block(ticket)
+    findings, checklist = [], []
+    for i, (path, chunk) in enumerate(files, 1):
+        say("file", f"{i}/{len(files)} {path}")
+        say("model", "")
+        part = ask_model(sys_file, preamble + _clip(chunk, MAX_DEEP_FILE_CHARS),
+                         on_delta=lambda text: say("model", text))
+        # The pass saw one file, so that file is where its findings are — a model naming
+        # another one is guessing, and a wrong path is worse than no path.
+        findings += [dict(f, file=path) for f in session_findings(part)]
+        checklist += [dict(c, file=path) for c in part.get("checklist", [])
+                      if isinstance(c, dict)]
+    findings, checklist = _dedupe_findings(findings), _dedupe_checklist(checklist)
+    # The per-file passes never saw each other, so the overview is its own pass. It reads
+    # the findings, not the diff — that is the whole reason it fits in one request.
+    say("summarising", f"{len(findings)} finding(s) across {len(files)} file(s)")
+    say("model", "")
+    digest = "\n".join(
+        f"- {f['severity']} {f['file']}: {f['what']}" for f in findings) or "(none)"
+    over = ask_model(SYS_PR_SUMMARY + project_block(ctx) + ticket_block(ticket),
+                     f"{preamble}FILES: {', '.join(p for p, _ in files)}\n\nFINDINGS:\n"
+                     f"{digest}", on_delta=lambda text: say("model", text))
+    return {"summary": over.get("summary", ""),
+            "suggestions": over.get("suggestions", []),
+            "findings": findings, "checklist": checklist,
+            "deep": {"files": [p for p, _ in files],
+                     "skipped": [p for p, _ in skipped]}}
+
 def run_pr_review(diff, source, name=None, project=None, no_project=False,
-                  pr_meta=None, story=None, no_ticket=False, progress=None):
+                  pr_meta=None, story=None, no_ticket=False, progress=None, deep=False):
     """Resolve context, charge it against the diff budget, ask the model, save the
     session. Shared by cmd_pr and the UI's /api/pr — never prints, never SystemExits.
 
@@ -1775,9 +1926,12 @@ def run_pr_review(diff, source, name=None, project=None, no_project=False,
         diff = diff[:budget]
         truncated = True
     say("diff", f"{len(diff)} chars from {source}" + (" (truncated)" if truncated else ""))
-    say("model", "")            # the wait starts here, before the first token lands
-    data = ask_model(SYS_PR + project_block(ctx) + ticket_block(ticket), preamble + diff,
-                     on_delta=lambda text: say("model", text))
+    if deep:
+        data = run_deep_review(diff, ctx, ticket, preamble, say)
+    else:
+        say("model", "")        # the wait starts here, before the first token lands
+        data = ask_model(SYS_PR + project_block(ctx) + ticket_block(ticket),
+                         preamble + diff, on_delta=lambda text: say("model", text))
     name = name or (f"pr-{pr_meta['number']}" if pr_meta
                     else datetime.now().strftime("pr-%Y%m%d-%H%M"))
     session = {
@@ -1786,6 +1940,9 @@ def run_pr_review(diff, source, name=None, project=None, no_project=False,
         "created": now_iso(),
         "summary": data.get("summary", ""),
         "findings": session_findings(data),
+        "suggestions": [s.strip() for s in data.get("suggestions") or []
+                        if isinstance(s, str) and s.strip()],
+        "deep": data.get("deep"),
         "truncated": truncated,
         "project": {"source": ctx_source, "chars": len(ctx)} if ctx else None,
         "pr": {"number": pr_meta["number"], "title": pr_meta.get("title", ""),
@@ -1802,7 +1959,8 @@ def run_pr_review(diff, source, name=None, project=None, no_project=False,
     return session
 
 _SPIN = "|/-\\"
-_STAGE_LABEL = {"context": "context", "ticket": "ticket", "diff": "diff"}
+_STAGE_LABEL = {"context": "context", "ticket": "ticket", "diff": "diff",
+                "file": "reviewing", "summarising": "summarising"}
 
 def _term_width(stream):
     """Columns to draw the live line in. A pty with no window size set — CI, some ssh
@@ -1893,7 +2051,7 @@ def cmd_pr(args):
     session = run_pr_review(diff, source, name=args.name, project=args.project,
                             no_project=args.no_project, pr_meta=pr_meta,
                             story=args.story, no_ticket=args.no_ticket,
-                            progress=pr_progress_printer())
+                            progress=pr_progress_printer(), deep=args.deep)
     print_pr(session)
     print(f"\nSaved as '{session['name']}'. After any interruption: focus pr resume")
 
@@ -1925,7 +2083,8 @@ def session_findings(d):
     out = []
     for f in d.get("findings") or []:
         if isinstance(f, str) and f.strip():
-            out.append({"severity": "risk", "file": "", "where": "", "what": f.strip()})
+            out.append({"severity": "risk", "file": "", "where": "", "what": f.strip(),
+                        "fix": ""})
         elif isinstance(f, dict) and (f.get("what") or f.get("where")):
             sev = str(f.get("severity") or "").strip().lower()
             # file/where are asked for bare and quoted by the renderer. Models quote them
@@ -1935,10 +2094,11 @@ def session_findings(d):
                         "file": str(f.get("file") or "").strip().strip("`"),
                         "where": _clip(str(f.get("where") or "").strip().strip("`"),
                                        MAX_WHERE_CHARS),
-                        "what": str(f.get("what") or "")})
+                        "what": str(f.get("what") or ""),
+                        "fix": str(f.get("fix") or "").strip()})
     if out:
         return out
-    return [{"severity": "risk", "file": "", "where": "", "what": r.strip()}
+    return [{"severity": "risk", "file": "", "where": "", "what": r.strip(), "fix": ""}
             for r in d.get("risks") or [] if isinstance(r, str) and r.strip()]
 
 def pr_markdown(s):
@@ -1955,6 +2115,9 @@ def pr_markdown(s):
         t = s["ticket"]
         meta.append(f"ticket: sc-{t['id']} {t.get('name', '')} "
                     f"(via {t.get('how', '?')}, {t['chars']} chars)".replace("  ", " "))
+    if s.get("deep"):
+        n = len(s["deep"].get("files") or [])
+        meta.append(f"deep review: {n} file{'s' if n != 1 else ''}, one pass each")
     out.append("*" + " · ".join(meta) + "*")
     if s.get("pr"):
         pr = s["pr"]
@@ -1979,6 +2142,18 @@ def pr_markdown(s):
         if f["what"]:
             out.append(textwrap.fill(f["what"], 78, initial_indent="  ",
                                      subsequent_indent="  "))
+        if f.get("fix"):
+            out.append(textwrap.fill("**Fix:** " + f["fix"], 78, initial_indent="  ",
+                                     subsequent_indent="  "))
+    if s.get("suggestions"):
+        out += ["", "### Suggestions"]
+        for sug in s["suggestions"]:
+            out.append(textwrap.fill(sug, 78, initial_indent="- ",
+                                     subsequent_indent="  "))
+    if (s.get("deep") or {}).get("skipped"):
+        out += ["", "> Not reviewed (past the "
+                f"{MAX_DEEP_FILES}-file deep-review cap): "
+                + ", ".join(f"`{p}`" for p in s["deep"]["skipped"])]
     done = sum(1 for c in s["checklist"] if c["done"])
     out += ["", f"### Checklist — {done}/{len(s['checklist'])} done",
             "Tick with `focus pr check N`.", ""]
@@ -2377,7 +2552,7 @@ def shortcut_state():
 # rather than the response body — no streaming socket to keep alive, nothing added to
 # /api/state, and a reloaded page can still find the review it left running.
 _PR_PROGRESS = {"active": False, "stage": "", "text": "", "chars": 0, "summary": "",
-                "started": 0.0}
+                "file": "", "started": 0.0}
 _PR_PROGRESS_LOCK = threading.Lock()
 
 def ui_pr_progress(stage, text=""):
@@ -2387,14 +2562,20 @@ def ui_pr_progress(stage, text=""):
     with _PR_PROGRESS_LOCK:
         _PR_PROGRESS.update(active=True, stage=stage)
         if stage == "model":
+            # `file` survives a model stage on purpose: in a deep review it is which of
+            # the seven files this minute is being spent on, which is the whole question.
             _PR_PROGRESS.update(chars=len(text), summary=_partial_summary(text), text="")
         else:
             _PR_PROGRESS["text"] = text
+            if stage == "file":
+                _PR_PROGRESS["file"] = text
+            elif stage in ("diff", "fetch"):
+                _PR_PROGRESS["file"] = ""
 
 def pr_progress_begin(stage, text=""):
     with _PR_PROGRESS_LOCK:
         _PR_PROGRESS.update(active=True, stage=stage, text=text, chars=0, summary="",
-                            started=time.time())
+                            file="", started=time.time())
 
 def pr_progress_end():
     with _PR_PROGRESS_LOCK:
@@ -2850,7 +3031,7 @@ class UIHandler(BaseHTTPRequestHandler):
                             no_project=body.get("no_project", False), pr_meta=pr_meta,
                             story=body.get("story") or None,
                             no_ticket=body.get("no_ticket", False),
-                            progress=ui_pr_progress)
+                            progress=ui_pr_progress, deep=body.get("deep", False))
                     finally:
                         # However this ends — reply, dead model, raised error — the poll
                         # has to stop saying a review is running.
@@ -2990,8 +3171,12 @@ details.sub{margin-top:10px;}
 details.sub summary{cursor:pointer;font-size:.88rem;font-weight:600;color:var(--accent);}
 details.sub>*{margin-top:8px;}
 .facts li,.risks li,.findings li{margin:2px 0 2px 18px;font-size:.9rem;}
-.findings li{margin-bottom:6px;}
-.findings code{font-size:.82rem;opacity:.85;}
+.findings li{margin-bottom:8px;}
+.findings code,.check code{font-size:.82rem;opacity:.85;}
+.fix{margin-top:2px;font-size:.88rem;color:var(--soft);}
+.prose{white-space:pre-wrap;background:var(--accent-soft);border-radius:8px;
+  padding:8px 10px;margin-top:8px;font-size:.92rem;}
+.prose code,.fix code{background:rgba(0,0,0,.06);border-radius:4px;padding:0 3px;}
 .sev{font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.04em;
   border-radius:4px;padding:1px 5px;margin-right:6px;}
 .sev-bug{background:var(--red);color:#fff;}
@@ -3106,7 +3291,7 @@ background:var(--green-soft);border-radius:999px;padding:1px 8px;}
   </details>
 
   <details class="panel" id="prPanel">
-    <summary>PR review <span class="muted">summarise a diff, get a checklist</span></summary>
+    <summary>PR review <span class="muted">what's wrong with this diff, and what to do about it</span></summary>
     <textarea id="prDiff" placeholder="paste a unified diff… (or use the repo button below)" style="margin-top:10px"></textarea>
     <div class="row">
       <input type="text" id="prName" placeholder="session name (optional)" style="width:180px">
@@ -3114,6 +3299,7 @@ background:var(--green-soft);border-radius:999px;padding:1px 8px;}
       <button id="prGitBtn" onclick="doPr('git')">Review changes in repo</button>
       <button id="prFetchBtn" onclick="doPr('fetch')">Review this branch's PR</button>
       <button onclick="doPr('resume')">Resume last session</button>
+      <label class="muted" style="cursor:pointer" title="One model pass per changed file, then a summary pass. Much deeper, and minutes rather than seconds."><input type="checkbox" id="prDeep"> deep (a pass per file)</label>
       <label class="muted" style="cursor:pointer"><input type="checkbox" id="prNoProject"> skip project context</label>
       <label class="muted" style="cursor:pointer"><input type="checkbox" id="prNoTicket"> skip ticket</label>
       <span class="muted" id="prStatus"></span>
@@ -3296,6 +3482,27 @@ function renderBoard(){
     board.appendChild(col);
   }
 }
+// Inline markdown — `code`, **bold**, *italic* — the three things the prompts ask the
+// model to write. Built as DOM nodes and never innerHTML: this is model output quoting
+// the user's own diff, and a stray < or & has to stay a character, not become a tag.
+function mdInline(text,parent){
+  const re=/(`[^`]+`|\*\*[^*]+\*\*|\*[^*\s][^*]*\*)/g;
+  let last=0,m;
+  while((m=re.exec(text))!==null){
+    if(m.index>last)parent.appendChild(document.createTextNode(text.slice(last,m.index)));
+    const t=m[0];
+    let el;
+    if(t[0]==="`"){el=document.createElement("code");el.textContent=t.slice(1,-1);}
+    else if(t.startsWith("**")){el=document.createElement("strong");el.textContent=t.slice(2,-2);}
+    else{el=document.createElement("em");el.textContent=t.slice(1,-1);}
+    parent.appendChild(el);
+    last=m.index+t.length;
+  }
+  if(last<text.length)parent.appendChild(document.createTextNode(text.slice(last)));
+  return parent;
+}
+function mdDiv(text,cls){const d=document.createElement("div");
+  if(cls)d.className=cls;return mdInline(text||"",d);}
 function addBtn(parent,label,fn){const b=document.createElement("button");
   b.textContent=label;b.onclick=fn;parent.appendChild(b);}
 function addLink(parent,url){if(!url)return;const a=document.createElement("a");
@@ -3370,8 +3577,12 @@ function prProgressText(p){
   if(p.stage==="fetch")return "fetching the pull request…"+t;
   if(p.stage==="context")return "project context: "+p.text+t;
   if(p.stage==="ticket")return "ticket "+p.text+t;
-  if(p.stage==="model")
-    return (p.summary?"reading the diff: "+p.summary:"reading the diff…")+t;
+  if(p.stage==="file")return "reading "+p.text+t;
+  if(p.stage==="summarising")return "writing the overview — "+p.text+t;
+  if(p.stage==="model"){
+    const what=p.file?"reading "+p.file:"reading the diff";
+    return what+(p.summary?": "+p.summary:" — "+p.chars+" chars in")+t;
+  }
   if(p.stage==="saved")return "";
   return p.text+t;
 }
@@ -3397,8 +3608,10 @@ async function doPr(mode){
   if(mode!=="resume"){
     body.no_project=document.getElementById("prNoProject").checked;
     body.no_ticket=document.getElementById("prNoTicket").checked;
+    body.deep=document.getElementById("prDeep").checked;
     s.textContent=mode==="fetch"?"fetching the PR, then reviewing…"
-      :"reviewing… (local models take a minute)";
+      :(body.deep?"deep review — one pass per changed file, this takes a while…"
+        :"reviewing… (local models take a minute)");
     startPrPoll();
   }
   try{const r=await api("/api/pr",body);s.textContent="";renderPr(r);
@@ -3425,8 +3638,13 @@ function renderPr(sn){
     addLink(p,sn.pr.url);
     o.appendChild(p);
   }
-  const sum=document.createElement("pre");sum.className="out";
-  sum.textContent=sn.summary;o.appendChild(sum);
+  if(sn.deep){
+    const d=document.createElement("div");d.className="muted";
+    const n=(sn.deep.files||[]).length;
+    d.textContent="deep review · "+n+" file"+(n===1?"":"s")+", one pass each";
+    o.appendChild(d);
+  }
+  o.appendChild(mdDiv(sn.summary,"prose"));
   if(sn.truncated){const w=document.createElement("div");w.className="warn";
     w.textContent="!! Diff was truncated — large PR. Review the tail manually.";
     o.appendChild(w);}
@@ -3446,11 +3664,29 @@ function renderPr(sn){
       s2.textContent=f.severity||"risk";li.appendChild(s2);
       const where=[f.file,f.where].filter(Boolean).join(" · ");
       if(where){const c=document.createElement("code");c.textContent=where;
-        li.appendChild(c);li.appendChild(document.createTextNode(" "));}
-      li.appendChild(document.createTextNode(f.what||""));
+        li.appendChild(c);li.appendChild(document.createElement("br"));}
+      mdInline(f.what||"",li);
+      if(f.fix){
+        const fx=document.createElement("div");fx.className="fix";
+        const lab=document.createElement("strong");lab.textContent="Fix: ";
+        fx.appendChild(lab);mdInline(f.fix,fx);li.appendChild(fx);
+      }
       ul.appendChild(li);
     }
     o.appendChild(ul);
+  }
+  if((sn.suggestions||[]).length){
+    const h2=document.createElement("div");h2.className="muted";
+    h2.style.marginTop="6px";h2.textContent="Suggestions:";o.appendChild(h2);
+    const ul2=document.createElement("ul");ul2.className="findings";
+    for(const g of sn.suggestions){const li=document.createElement("li");
+      mdInline(g,li);ul2.appendChild(li);}
+    o.appendChild(ul2);
+  }
+  if((sn.deep||{}).skipped&&sn.deep.skipped.length){
+    const w=document.createElement("div");w.className="warn";
+    w.textContent="Not reviewed (past the file cap): "+sn.deep.skipped.join(", ");
+    o.appendChild(w);
   }
   const chk=document.createElement("div");chk.className="check";
   chk.style.marginTop="8px";
@@ -3461,7 +3697,10 @@ function renderPr(sn){
     b.checked=c.done;b.disabled=c.done;
     b.onchange=()=>prCheck(i+1);
     l.appendChild(b);
-    l.appendChild(document.createTextNode(c.file+": "+c.item));
+    const txt=document.createElement("span");
+    const cf=document.createElement("code");cf.textContent=c.file;
+    txt.appendChild(cf);txt.appendChild(document.createTextNode(" — "));
+    mdInline(c.item,txt);l.appendChild(txt);
     if(!c.done&&!here){here=true;
       const m=document.createElement("span");m.className="here";
       m.textContent=" ← you are here";l.appendChild(m);}
@@ -3964,6 +4203,9 @@ def main(argv=None):
     s.add_argument("--project", help="project profile to use, or 'none' to skip context")
     s.add_argument("--no-ticket", action="store_true", help=NO_TICKET_HELP)
     s.add_argument("--story", help=STORY_HELP)
+    s.add_argument("--deep", action="store_true",
+                   help="one model pass per changed file, then a summary pass — much "
+                        "deeper, and minutes rather than seconds")
     # pre-verb spellings, still honoured so nothing anyone has typed before breaks
     s.add_argument("--resume", action="store_true", help=argparse.SUPPRESS)
     s.add_argument("--check", type=int, help=argparse.SUPPRESS)
