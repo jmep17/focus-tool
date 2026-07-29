@@ -162,6 +162,11 @@ line where the summary writes itself out a few words at a time. The dashboard
 shows the same thing under the Review button. Piped or redirected, it prints one
 plain line per step instead of animating.
 
+What gets reviewed is your working tree as it stands — staged *and* unstaged,
+everything since the last commit. If it falls back to the branch's PR and you have
+commits that aren't pushed yet, it says so, because GitHub only has what you sent
+it.
+
 You don't have to find the diff yourself. With nothing staged, `focus pr` asks
 your own `gh` for the pull request on the branch you're standing on, names the
 session after it (`pr-4521`), and puts the PR's title and description in front of

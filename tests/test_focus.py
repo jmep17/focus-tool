@@ -119,6 +119,21 @@ check("pr summary shown", "retry logic" in out, out)
 check("pr risks shown", "double-charge" in out)
 check("pr checklist has position marker", "<- you are here" in out)
 
+# --- the model is told how to read a diff. Without this it reviews deleted lines and
+# recommends fixes the + lines already make, which reads as "it mixed up my diff".
+check("the prompt says - lines are already gone",
+      "ALREADY BEEN DELETED" in mock_llm.SEEN[-1], mock_llm.SEEN[-1][:400])
+check("the prompt says to re-read the + lines before writing a finding",
+      "if they already do the thing you" in mock_llm.SEEN[-1])
+check("project context is framed as reference, not as work to request",
+      "never turn a convention into a finding" in focus.PROJECT_HEADER)
+check("ticket criteria are not a to-do list to repeat back",
+      "not a to-do list to repeat back" in focus.TICKET_HEADER)
+check("a stale review says so rather than looking current",
+      "2 commit(s) not pushed" in focus.pr_markdown(
+          {"name": "n", "source": "PR #1", "summary": "s", "checklist": [],
+           "findings": [], "unpushed": 2}))
+
 # --- the review is markdown, and leads with findings rather than chores
 check("pr output is markdown", "## PR review — test-pr" in out, out)
 check("pr leads with findings", out.index("### Findings") < out.index("### Checklist"), out)
@@ -657,6 +672,38 @@ status, body = api("/api/pr", {"action": "resume"})
 check("ui pr resume finds latest", json.loads(body)["name"] == "ui-pr")
 check("git_working_diff returns a pair",
       isinstance(focus.git_working_diff(), tuple) and len(focus.git_working_diff()) == 2)
+
+# --- the working diff must be everything since the last commit, not the staged snapshot.
+# Staging then carrying on editing is the normal way to work, and reviewing the staged
+# version means the review recommends fixes you already made.
+import subprocess as _sp
+work_repo = tempfile.mkdtemp(prefix="focus-work-")
+
+def _grun(*argv):
+    return _sp.run(["git"] + list(argv), cwd=work_repo, capture_output=True, text=True)
+
+_grun("init", "-q", ".")
+_grun("config", "user.email", "t@t")
+_grun("config", "user.name", "t")
+with open(os.path.join(work_repo, "pay.py"), "w") as f:
+    f.write("def pay(x):\n    return charge(x)\n")
+_grun("add", "-A")
+_grun("commit", "-qm", "base")
+with open(os.path.join(work_repo, "pay.py"), "w") as f:      # stage a half-done change
+    f.write("def pay(x):\n    for i in range(3):\n        return charge(x)\n")
+_grun("add", "pay.py")
+with open(os.path.join(work_repo, "pay.py"), "w") as f:      # then fix it, unstaged
+    f.write("def pay(x):\n    for i in range(3):\n"
+            "        return charge(x, idempotency_key=k)\n")
+wd, wsrc = focus.git_working_diff(work_repo)
+check("the working diff carries the fix made after staging",
+      "idempotency_key=k" in wd, wd)
+check("the working diff is the one that sees everything since HEAD",
+      wsrc == "git diff HEAD", wsrc)
+_grun("stash", "-q", "-u")                                    # nothing outstanding at all
+check("a clean tree reports no diff", focus.git_working_diff(work_repo)[0] is None)
+check("unpushed_commits is 0 with no upstream", focus.unpushed_commits(work_repo) == 0)
+check("unpushed_commits is 0 outside a repo", focus.unpushed_commits(TMP) == 0)
 
 # --- UI: memory edit/off (back to disabled, the state the tail of the suite expects)
 m = json.loads(api("/api/memory", {"action": "edit", "text": "fact one\n\nfact two\n"})[1])

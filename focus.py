@@ -309,6 +309,13 @@ Reply with ONLY this JSON:
 SYS_PR = """You help a developer with ADHD review a pull request without drowning.
 You are given a unified diff. What a reviewer needs first is what is WRONG with it:
 findings first, chores second.
+How to read the diff, before anything else:
+- A line starting with "-" has ALREADY BEEN DELETED. It is not in the code any more.
+  Never review it, and never ask for it to be changed or removed.
+- A line starting with "+" is the code as it stands now. Judge that.
+- Before you write a finding, re-read the "+" lines: if they already do the thing you
+  were about to ask for, there is no finding. Recommending a fix that is already in
+  the diff is the single worst thing you can do here.
 Rules:
 - findings are concrete problems you can point at in this diff. Each one names the
   file, quotes the line or symbol it is about, and says in one sentence what breaks
@@ -347,6 +354,13 @@ Reply with ONLY this JSON:
 SYS_PR_FILE = """You are reviewing ONE file out of a larger pull request, closely.
 You get the whole diff for that one file, so there is no excuse for skimming: read
 every changed line and say what is wrong with it.
+How to read the diff, before anything else:
+- A line starting with "-" has ALREADY BEEN DELETED. It is not in the code any more.
+  Never review it, and never ask for it to be changed or removed.
+- A line starting with "+" is the code as it stands now. Judge that.
+- Before you write a finding, re-read the "+" lines: if they already do the thing you
+  were about to ask for, there is no finding. Recommending a fix that is already in
+  the diff is the single worst thing you can do here.
 Rules:
 - findings are concrete problems in THIS file's diff. Each quotes the line or symbol
   it is about, says in one sentence what breaks and when, and gives the fix you would
@@ -773,7 +787,10 @@ def resolve_project_context(query="", budget=MAX_CONTEXT_CHARS, name=None, disab
 
 PROJECT_HEADER = ("\nPROJECT CONTEXT — how THIS repo actually works. Prefer these "
                   "conventions, invariants and known-fragile areas over generic advice, "
-                  "and name the convention when a risk follows from one:\n")
+                  "and name the convention when a risk follows from one. This is "
+                  "reference material describing what is already true, not a list of work "
+                  "to request: never turn a convention into a finding unless the code in "
+                  "front of you actually breaks it:\n")
 
 def project_block(text):
     """Format already-resolved context. Split out because cmd_pr needs the source label
@@ -1046,7 +1063,9 @@ def resolve_ticket_context(budget=MAX_TICKET_CHARS, story=None, disabled=False,
 
 # The marker line the mock's dispatch splits on — keep in sync with tests/mock_llm.py.
 TICKET_HEADER = ("\nTICKET CONTEXT — the story this work is meant to deliver. Judge the "
-                 "work against what it asks for, and say so when the two disagree:\n")
+                 "work against what it asks for, and say so when the two disagree. Its "
+                 "acceptance criteria are not a to-do list to repeat back: only mention "
+                 "one when the code in front of you fails to meet it:\n")
 
 def ticket_block(text):
     """Format already-resolved ticket text. Split out for the same reason as
@@ -1702,10 +1721,17 @@ MAX_DIFF_CHARS = 60_000
 MAX_PR_BODY_CHARS = 1_500    # ceiling on the PR description put ahead of the diff
 
 def git_working_diff(root=None):
-    """(diff, source) from staged then unstaged changes, or (None, None). The UI calls
+    """(diff, source) for everything since the last commit, or (None, None). The UI calls
     this directly — get_diff's stdin tier would block a server thread forever — and
-    passes the picked repo as `root`, so the diff comes from the repo on screen."""
-    for cmd in (["git", "diff", "--staged"], ["git", "diff", "HEAD"]):
+    passes the picked repo as `root`, so the diff comes from the repo on screen.
+
+    `git diff HEAD` first, and it wins in every normal case: it is staged + unstaged, a
+    strict superset of `git diff --staged`. Asking for the staged snapshot first — which
+    this used to do — means that the moment you stage something and keep working, the
+    review is of an older version of the file, and it comes back recommending fixes you
+    already made. `--staged` survives only for a repo with no commits yet, where there is
+    no HEAD to diff against."""
+    for cmd in (["git", "diff", "HEAD"], ["git", "diff", "--staged"]):
         try:
             out = subprocess.run(cmd, capture_output=True, text=True, timeout=15,
                                  cwd=root)
@@ -1714,6 +1740,17 @@ def git_working_diff(root=None):
         except (OSError, subprocess.TimeoutExpired):
             pass
     return None, None
+
+def unpushed_commits(root=None):
+    """How many commits the branch has that its remote doesn't, or 0 when there is no
+    upstream / no git / anything odd. `gh pr diff` returns what is *pushed*, so with
+    commits sitting locally the review is of an older version of the branch — the other
+    way a review comes back recommending a fix you already made."""
+    out = _git(["rev-list", "--count", "@{upstream}..HEAD"], cwd=root)
+    try:
+        return int(out.strip())
+    except (ValueError, AttributeError):
+        return 0
 
 PR_FIELDS = "number,title,body,url,headRefName,baseRefName,isDraft"
 
@@ -1919,6 +1956,11 @@ def run_pr_review(diff, source, name=None, project=None, no_project=False,
         refresh=True)
     if ticket_info:
         say("ticket", f"sc-{ticket_info['id']} {ticket_info.get('name', '')}".strip())
+    # Only on the PR path: this is a review of what GitHub has, and what GitHub has is
+    # what was pushed. One `git` call, and only where two `gh` ones were already spent.
+    ahead = unpushed_commits(active_root()) if pr_meta else 0
+    if ahead:
+        say("stale", f"{ahead} local commit(s) not pushed — reviewing what's on GitHub")
     preamble = _pr_preamble(pr_meta)
     truncated = False
     budget = MAX_DIFF_CHARS - len(ctx) - len(ticket) - len(preamble)
@@ -1944,6 +1986,7 @@ def run_pr_review(diff, source, name=None, project=None, no_project=False,
                         if isinstance(s, str) and s.strip()],
         "deep": data.get("deep"),
         "truncated": truncated,
+        "unpushed": ahead,
         "project": {"source": ctx_source, "chars": len(ctx)} if ctx else None,
         "pr": {"number": pr_meta["number"], "title": pr_meta.get("title", ""),
                "url": pr_meta.get("url", ""), "branch": pr_meta.get("headRefName", ""),
@@ -1960,7 +2003,7 @@ def run_pr_review(diff, source, name=None, project=None, no_project=False,
 
 _SPIN = "|/-\\"
 _STAGE_LABEL = {"context": "context", "ticket": "ticket", "diff": "diff",
-                "file": "reviewing", "summarising": "summarising"}
+                "file": "reviewing", "summarising": "summarising", "stale": "!!"}
 
 def _term_width(stream):
     """Columns to draw the live line in. A pty with no window size set — CI, some ssh
@@ -2127,6 +2170,9 @@ def pr_markdown(s):
     out += ["", "### What it does", textwrap.fill(s.get("summary", ""), 78)]
     if s.get("truncated"):
         out += ["", "> **Diff was truncated** — large PR. Review the tail manually."]
+    if s.get("unpushed"):
+        out += ["", f"> **{s['unpushed']} commit(s) not pushed.** This reviews what is on "
+                "GitHub, so anything you fixed locally since is not in it."]
     findings = session_findings(s)
     out += ["", "### Findings"]
     if not findings:
@@ -3578,6 +3624,7 @@ function prProgressText(p){
   if(p.stage==="context")return "project context: "+p.text+t;
   if(p.stage==="ticket")return "ticket "+p.text+t;
   if(p.stage==="file")return "reading "+p.text+t;
+  if(p.stage==="stale")return "⚠ "+p.text;
   if(p.stage==="summarising")return "writing the overview — "+p.text+t;
   if(p.stage==="model"){
     const what=p.file?"reading "+p.file:"reading the diff";
@@ -3647,6 +3694,10 @@ function renderPr(sn){
   o.appendChild(mdDiv(sn.summary,"prose"));
   if(sn.truncated){const w=document.createElement("div");w.className="warn";
     w.textContent="!! Diff was truncated — large PR. Review the tail manually.";
+    o.appendChild(w);}
+  if(sn.unpushed){const w=document.createElement("div");w.className="warn";
+    w.textContent="!! "+sn.unpushed+" commit(s) not pushed — this reviews what is on "+
+      "GitHub, so anything you fixed locally since is not in it.";
     o.appendChild(w);}
   // sessions written before findings existed carry `risks`, a list of bare strings
   const fs=(sn.findings||[]).map(f=>typeof f==="string"

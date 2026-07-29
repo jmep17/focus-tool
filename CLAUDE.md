@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-python3 tests/test_focus.py           # the whole test suite (~285 checks, no pytest)
+python3 tests/test_focus.py           # the whole test suite (~295 checks, no pytest)
 uv tool install --editable .          # install `focus` on PATH, running this folder live
 uv run --script focus.py <subcommand> # run without installing (PEP 723 header, zero deps)
 focus doctor                          # check which local model server is reachable
@@ -193,6 +193,25 @@ only file in `~/.focus/` holding a credential, and the only caller of `save_json
 mode=0o600)` — the chmod lands on the temp file *before* `os.replace`, since replace
 preserves the source's mode. `focus shortcut token` reads from stdin, never argv, so a
 token never enters shell history or `ps`.
+
+**A review must be of the code as it is now.** Two ways that quietly stops being true, and
+both come back as "the model is recommending fixes I already made":
+
+1. `git_working_diff` asks `git diff HEAD` **first** — staged + unstaged. It used to ask
+   `git diff --staged` first, which means the moment you stage something and keep working,
+   the review is of the older file. `--staged` is a strict subset; it survives only as the
+   fallback for a repo with no commits, where there is no HEAD to diff against. Don't put
+   it back on top.
+2. `gh pr diff` returns what is **pushed**. `unpushed_commits()` (one `git rev-list`, only
+   on the PR path, 0 on any failure) puts the count in the session so `pr_markdown` and the
+   dashboard can say the review is of an older branch than the one on disk.
+
+The prompts also state diff semantics outright — `-` lines are already deleted, `+` lines
+are the current code, re-read them before writing a finding — because a small model
+reviewing a `-` line as if it were live produces exactly the same complaint. For the same
+reason `PROJECT_HEADER` and `TICKET_HEADER` say their contents are reference material, not
+work to request: a conventions list and a ticket's acceptance criteria both read as to-do
+lists, and come back as findings against code that already satisfies them.
 
 **`focus pr` can pull its own diff.** `get_diff()` tiers are `-f` → stdin → working tree →
 the branch's PR. The PR sits **below** the working tree deliberately: uncommitted changes
