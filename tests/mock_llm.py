@@ -3,8 +3,24 @@ import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+# Every system prompt this mock has been sent, newest last. The mock runs in-process, so
+# tests read it directly to assert what reached the model without decoding canned replies.
+SEEN = []
+
 def canned_reply(messages):
-    system = messages[0]["content"]
+    full = messages[0]["content"]
+    # Dispatch on the BASE prompt only. Everything after a suffix marker is arbitrary
+    # user/repo text — this repo's own CLAUDE.md documents the string "brain-dump", so
+    # dispatching on the whole thing answers a PR request with a task list.
+    system = (full.split("\nMATCH THIS PERSON'S VOICE")[0]
+              .split("\nPROJECT CONTEXT")[0]
+              .split("\nUSER MEMORY")[0])
+    if "compact project profile" in system:
+        return json.dumps({"profile":
+            "## Stack\nPython 3.9, stdlib only, no dependencies.\n"
+            "## Conventions\nAll writes go through save_json (tmp then os.replace).\n"
+            "## payments/\nEvery retry must carry an idempotency key.\n"
+            "## frontend/\nReact, no state library.\n"})
     if "brain-dump" in system:
         return json.dumps({"tasks": [
             {"title": "Fix flaky auth test", "priority": 1, "estimate_min": 45},
@@ -32,7 +48,7 @@ def canned_reply(messages):
             "Example: 'hey — quick one: can you swap Thursday? Cheers, J'"})
     if "write work messages" in system:
         base = "Hi Priya — quick one: I can cover Tuesday but not Thursday. Could you swap? Happy either way."
-        if "MATCH THIS PERSON'S VOICE" in system:
+        if "MATCH THIS PERSON'S VOICE" in full:
             return "[voiced] " + base
         return base
     return "ok"
@@ -56,6 +72,7 @@ class MockHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0))
         payload = json.loads(self.rfile.read(n).decode())
+        SEEN.append(payload["messages"][0]["content"])
         content = canned_reply(payload["messages"])
         body = json.dumps({"choices": [{"message": {"role": "assistant",
                                                     "content": content}}]}).encode()
