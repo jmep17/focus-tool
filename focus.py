@@ -6,9 +6,13 @@
 """
 focus — a local-first ADHD companion for developers.
 
-Everything runs on your Mac. AI features talk to a local model server
-(LM Studio on :1234 or Ollama on :11434) over localhost. No accounts,
-no cloud, no telemetry. Non-AI commands work with no model running.
+Everything you write runs on your Mac. AI features talk to a local model server
+(LM Studio on :1234 or Ollama on :11434) over localhost. No accounts, no cloud,
+no telemetry. Non-AI commands work with no model running.
+
+Two features read from elsewhere, and only ever read: `focus pr` can pull the
+current branch's pull request through your own `gh` CLI, and `focus shortcut`
+fetches the ticket you're working on. Nothing is ever sent out.
 
 Commands:
   focus dump [text]        Brain-dump -> structured tasks (AI, with fallback)
@@ -27,6 +31,7 @@ Commands:
   focus draft [...]        Bullets -> polished message (AI)
   focus memory [...]       Facts the AI remembers about you (local only)
   focus project [...]      Teach the AI features about this codebase (AI)
+  focus shortcut [...]     Pull the Shortcut ticket you're working on into prompts
   focus ui                 Open the local dashboard
   focus doctor             Check local model connectivity
 
@@ -55,6 +60,7 @@ def focus_home():
     os.makedirs(os.path.join(home, "pr"), exist_ok=True)
     os.makedirs(os.path.join(home, "projects"), exist_ok=True)
     os.makedirs(os.path.join(home, "memory"), exist_ok=True)
+    os.makedirs(os.path.join(home, "shortcut"), exist_ok=True)
     return home
 
 def _path(name):
@@ -67,10 +73,15 @@ def load_json(path, default):
     except (FileNotFoundError, json.JSONDecodeError):
         return default
 
-def save_json(path, data):
+def save_json(path, data, mode=None):
+    """Atomic write. `mode` (0o600 for the one file holding a token) is applied to the
+    temp file before the rename — os.replace keeps the source's mode, so chmodding the
+    final path instead would leave a window where the secret is world-readable."""
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+    if mode is not None:
+        os.chmod(tmp, mode)
     os.replace(tmp, path)
 
 def now_iso():
@@ -126,11 +137,11 @@ DEFAULT_ENDPOINTS = [
 def load_config():
     return load_json(_path("config.json"), {})
 
-def http_json(url, payload=None, timeout=None):
+def http_json(url, payload=None, timeout=None, headers=None):
     data = json.dumps(payload).encode() if payload is not None else None
-    req = urllib.request.Request(
-        url, data=data, headers={"Content-Type": "application/json"}
-    )
+    head = {"Content-Type": "application/json"}
+    head.update(headers or {})
+    req = urllib.request.Request(url, data=data, headers=head)
     with urllib.request.urlopen(req, timeout=timeout or 120) as resp:
         return json.loads(resp.read().decode())
 
@@ -344,6 +355,31 @@ def _git(argv, cwd=None):
     except (OSError, subprocess.TimeoutExpired):
         return ""
     return out.stdout if out.returncode == 0 else ""
+
+def _gh(argv, cwd=None, timeout=30):
+    """Run a `gh` subcommand -> (stdout, reason). reason is "" on success, else a short
+    sentence fit to print. Unlike _git this reports why it failed: `focus pr fetch` is an
+    explicit request, and "nothing happened" is a bad answer to one. Never raises.
+
+    This is the one place focus reaches GitHub, and it does it through the user's own
+    already-authenticated gh — focus stores no token and speaks no GitHub API itself.
+    """
+    try:
+        out = subprocess.run(["gh"] + argv, capture_output=True, text=True,
+                             timeout=timeout, cwd=cwd)
+    except FileNotFoundError:
+        return "", "GitHub CLI not installed — `brew install gh`, then `gh auth login`."
+    except (OSError, subprocess.TimeoutExpired):
+        return "", "GitHub CLI didn't respond."
+    if out.returncode == 0:
+        return out.stdout, ""
+    err = " ".join(out.stderr.split())
+    low = err.lower()
+    if "no pull requests found" in low or "no default remote" in low:
+        return "", "No pull request found for this branch."
+    if "auth" in low and "login" in low:
+        return "", "GitHub CLI isn't logged in — run `gh auth login`."
+    return "", err.split(". ")[0][:200] or "GitHub CLI failed."
 
 def _remote_ident(root):
     """github.com/you/repo from either an https or an scp-style remote URL."""
@@ -622,6 +658,279 @@ def project_block(text):
 
 def project_system_suffix(query="", budget=MAX_CONTEXT_CHARS, name=None, disabled=False):
     return project_block(resolve_project_context(query, budget, name, disabled)[0])
+
+# ---------------------------------------------------------------- shortcut tickets
+
+# The one remote host focus talks to itself. Overridable so the tests can point it at a
+# local fake, the same way config.json's `endpoint` points the model client at mock_llm.
+SHORTCUT_API = "https://api.app.shortcut.com/api/v3"
+
+MAX_TICKET_CHARS = 2_000     # ceiling on the ticket injected into `focus pr`
+BRIEF_TICKET_CHARS = 800     # ...and into dump/break/draft, which gain less
+MAX_TICKET_COMMENTS = 3
+
+class TicketError(RuntimeError):
+    pass
+
+def shortcut_config_path():
+    return _path("shortcut.json")
+
+def load_shortcut_config():
+    return load_json(shortcut_config_path(), {})
+
+def save_shortcut_config(c):
+    # 0600: the only file in ~/.focus/ that holds a credential.
+    save_json(shortcut_config_path(), c, mode=0o600)
+
+def shortcut_token(cfg=None):
+    """Env first, so a token can be scoped to one shell without ever hitting disk.
+    Callers holding the config already pass it rather than re-reading the file."""
+    cfg = load_shortcut_config() if cfg is None else cfg
+    return (os.environ.get("SHORTCUT_API_TOKEN") or "").strip() \
+        or (cfg.get("token") or "").strip()
+
+def shortcut_endpoint(cfg=None):
+    cfg = load_shortcut_config() if cfg is None else cfg
+    return (cfg.get("endpoint") or SHORTCUT_API).rstrip("/")
+
+def story_path(sid):
+    return os.path.join(focus_home(), "shortcut", f"story-{safe_name(str(sid))}.json")
+
+def load_story(sid):
+    return load_json(story_path(sid), {})
+
+def save_story(s):
+    save_json(story_path(s["id"]), s)
+
+def cached_story_ids():
+    """Every cached story id, shortest first. The one place that knows the filename
+    convention — clear paths and listings go through it rather than re-deriving it."""
+    d = os.path.join(focus_home(), "shortcut")
+    try:
+        ids = [f[6:-5] for f in os.listdir(d)
+               if f.startswith("story-") and f.endswith(".json")]
+    except OSError:
+        return []
+    return sorted(ids, key=lambda x: (len(x), x))
+
+def _any_cached_story():
+    """Is anything cached at all? The gate in front of every AI command, so it stops at
+    the first hit rather than listing and sorting the whole directory."""
+    try:
+        with os.scandir(os.path.join(focus_home(), "shortcut")) as it:
+            return any(e.name.startswith("story-") and e.name.endswith(".json")
+                       for e in it)
+    except OSError:
+        return False
+
+def clear_story_cache():
+    """Delete every cached story, returning the ids that went."""
+    ids = cached_story_ids()
+    for sid in ids:
+        os.remove(story_path(sid))
+    return ids
+
+def ticket_repo_path(key):
+    """This repo's branch->story pins. Same two-scope shape as memory: its own
+    `disabled` flag, independent of the global one."""
+    return os.path.join(focus_home(), "shortcut", "repo-" + key + ".json")
+
+def load_ticket_repo(key=None):
+    return load_json(ticket_repo_path(key or project_key()), {})
+
+def save_ticket_repo(r, key=None):
+    save_json(ticket_repo_path(key or project_key()), r)
+
+def save_shortcut_token(token):
+    cfg = load_shortcut_config()
+    cfg["token"] = token
+    cfg.pop("disabled", None)     # saving a token is opting in
+    save_shortcut_config(cfg)
+
+def pin_story(sid):
+    """Pin a story to the branch you're on, and return that branch (or "" if git can't
+    name one — a detached HEAD still gets the ticket, just not a durable pin)."""
+    branch = current_branch(project_root())
+    if branch:
+        r = load_ticket_repo()
+        r.setdefault("branches", {})[branch] = str(sid)
+        r.pop("disabled", None)
+        save_ticket_repo(r)
+    return branch
+
+def set_ticket_enabled(on, here=False):
+    """Flip the `disabled` flag in one scope. Shared by the CLI verb and /api/shortcut so
+    the two scopes' bookkeeping is written once, not once per caller per scope."""
+    load, save = ((load_ticket_repo, save_ticket_repo) if here
+                  else (load_shortcut_config, save_shortcut_config))
+    cfg = load()
+    if on:
+        cfg.pop("disabled", None)
+    else:
+        cfg["disabled"] = True
+    save(cfg)
+
+def current_branch(root=None):
+    return _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=root).strip()
+
+# Shortcut's own branch convention is `you/sc-12345/some-title`, and its UI links are
+# .../story/12345/slug — so both spellings are worth recognising.
+_SC_RE = re.compile(r"\bsc-(\d+)\b", re.I)
+_SC_URL_RE = re.compile(r"app\.shortcut\.com/[\w.-]+/story/(\d+)")
+
+def _story_id_in(text):
+    if not text:
+        return None
+    m = _SC_URL_RE.search(text) or _SC_RE.search(text)
+    return m.group(1) if m else None
+
+def detect_story_id(story=None, pr_meta=None, root=None, repo=None, deep=True):
+    """(id, how) — the story this work belongs to, first hit wins. Never raises: no
+    ticket is always a valid answer, so this can sit in front of every AI command.
+
+    `deep=False` drops the commit-log tier, which is a second `git` spawn to find the
+    weakest signal. Callers on the everyday path (dump/break/draft) pass False; the ones
+    the user asked for by name — pr, and the `shortcut` verbs — pay for it.
+    """
+    if story:
+        return str(story).lstrip("#").replace("sc-", ""), "given"
+    root = root or project_root()
+    branch = current_branch(root)
+    if branch:
+        repo = load_ticket_repo() if repo is None else repo
+        pinned = (repo.get("branches") or {}).get(branch)
+        if pinned:
+            return str(pinned), "pinned to " + branch
+        sid = _story_id_in(branch)
+        if sid:
+            return sid, "branch name"
+    if pr_meta:
+        sid = _story_id_in((pr_meta.get("title") or "") + "\n" + (pr_meta.get("body") or ""))
+        if sid:
+            return sid, "PR description"
+    if deep:
+        sid = _story_id_in(_git(["log", "--pretty=%s", "-n", "20"], cwd=root))
+        if sid:
+            return sid, "commit message"
+    return None, ""
+
+def _story_state(d):
+    if d.get("completed"):
+        return "done"
+    return "in progress" if d.get("started") else "not started"
+
+def render_story(d):
+    """A Shortcut story -> markdown, most important first. `_clip` cuts the tail, so the
+    order here *is* the priority order: name and description survive, comments don't."""
+    sid = d.get("id")
+    head = [f"sc-{sid} — {(d.get('name') or '').strip()}"]
+    facts = [f for f in (d.get("story_type"), _story_state(d)) if f]
+    if d.get("estimate"):
+        facts.append(f"estimate {d['estimate']}")
+    if facts:
+        head.append(" · ".join(facts))
+    out = ["\n".join(head)]
+    desc = (d.get("description") or "").strip()
+    if desc:
+        # Left whole: acceptance criteria usually live in here under the team's own
+        # heading, and guessing at which one would drop as much as it kept.
+        out.append("## Description\n" + desc)
+    tasks = [t for t in (d.get("tasks") or []) if t.get("description")]
+    if tasks:
+        out.append("## Tasks\n" + "\n".join(
+            f"- [{'x' if t.get('complete') else ' '}] {t['description'].strip()}"
+            for t in tasks))
+    comments = [c for c in (d.get("comments") or []) if (c.get("text") or "").strip()]
+    if comments:
+        out.append("## Latest comments\n" + "\n\n".join(
+            f"({(c.get('created_at') or '')[:10]}) {c['text'].strip()}"
+            for c in comments[-MAX_TICKET_COMMENTS:]))
+    return "\n\n".join(out)
+
+def fetch_story(sid, cfg=None):
+    """Fetch one story from Shortcut and cache it. Raises TicketError on any failure —
+    callers that must not break (a review, an injection) catch it and use the cache."""
+    cfg = load_shortcut_config() if cfg is None else cfg
+    token = shortcut_token(cfg)
+    if not token:
+        raise TicketError(
+            "No Shortcut token. Run `focus shortcut token` (or set SHORTCUT_API_TOKEN).\n"
+            "  Get one at app.shortcut.com -> Settings -> API Tokens.")
+    url = f"{shortcut_endpoint(cfg)}/stories/{sid}"
+    try:
+        d = http_json(url, timeout=15, headers={"Shortcut-Token": token})
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise TicketError("Shortcut rejected the token — `focus shortcut token` "
+                              "to replace it.")
+        if e.code == 404:
+            raise TicketError(f"Shortcut has no story sc-{sid}.")
+        raise TicketError(f"Shortcut returned HTTP {e.code}.")
+    except (urllib.error.URLError, OSError) as e:
+        raise TicketError(f"Couldn't reach Shortcut ({e}). Cached tickets still work.")
+    except (ValueError, KeyError) as e:
+        raise TicketError(f"Shortcut sent something unreadable ({e}).")
+    story = {
+        # Type, state and estimate live inside `text` via render_story — kept there
+        # rather than duplicated as fields nothing reads.
+        "id": d.get("id", sid),
+        "name": (d.get("name") or "").strip(),
+        "url": d.get("app_url", ""),
+        "text": render_story(d),
+        "fetched": now_iso(),
+    }
+    save_story(story)
+    return story
+
+def resolve_ticket_context(budget=MAX_TICKET_CHARS, story=None, disabled=False,
+                           pr_meta=None, refresh=False):
+    """(text, info) for the story behind this work, or ("", None). info is
+    {"id","name","url","how"}.
+
+    Reads the cache. Only `refresh=True` — which is `run_pr_review` alone — goes to the
+    network, and even then a failure falls back to the cache rather than breaking the
+    review. That is what keeps `focus dump` instant and working offline.
+    """
+    if disabled or story == "none":
+        return "", None
+    # Cheapest gate first. With nothing cached and no way to fetch, no tier below can
+    # succeed — so bail before the file reads and git shell-outs that detection costs.
+    # A user who has never touched Shortcut pays one os.scandir and nothing else.
+    cached = _any_cached_story()
+    if not cached and not refresh:
+        return "", None
+    cfg = load_shortcut_config()
+    if cfg.get("disabled") or not (cached or shortcut_token(cfg)):
+        return "", None
+    repo = load_ticket_repo()
+    if repo.get("disabled"):
+        return "", None
+    sid, how = detect_story_id(story, pr_meta, repo=repo, deep=refresh)
+    if not sid:
+        return "", None
+    s = {}
+    if refresh:
+        try:
+            s = fetch_story(sid, cfg)
+        except TicketError:
+            pass                      # cache is the fallback; never break a review
+    s = s or load_story(sid)
+    if not s.get("text"):
+        return "", None
+    return _clip(s["text"], budget), {"id": str(sid), "name": s.get("name", ""),
+                                      "url": s.get("url", ""), "how": how}
+
+# The marker line the mock's dispatch splits on — keep in sync with tests/mock_llm.py.
+TICKET_HEADER = ("\nTICKET CONTEXT — the story this work is meant to deliver. Judge the "
+                 "work against what it asks for, and say so when the two disagree:\n")
+
+def ticket_block(text):
+    """Format already-resolved ticket text. Split out for the same reason as
+    project_block: run_pr_review needs the info record for the session."""
+    return TICKET_HEADER + text if text else ""
+
+def ticket_system_suffix(budget=BRIEF_TICKET_CHARS, story=None, disabled=False):
+    return ticket_block(resolve_ticket_context(budget, story, disabled)[0])
 
 # ---------------------------------------------------------------- history + memory
 
@@ -903,6 +1212,7 @@ def cmd_dump(args):
     try:
         system = SYS_DUMP + project_system_suffix(text, BRIEF_CONTEXT_CHARS,
                                                   disabled=args.no_project) \
+            + ticket_system_suffix(disabled=args.no_ticket) \
             + memory_system_suffix(args.no_memory, args.no_project)
         data = ask_model(system, text)
         for item in data.get("tasks", []):
@@ -959,6 +1269,7 @@ def cmd_break(args):
         context += "\nExtra context: " + " ".join(args.hint)
     system = SYS_BREAK + project_system_suffix(context, BRIEF_CONTEXT_CHARS,
                                                disabled=args.no_project) \
+        + ticket_system_suffix(story=args.story, disabled=args.no_ticket) \
         + memory_system_suffix(args.no_memory, args.no_project)
     data = ask_model(system, context)
     subs = data.get("subtasks", [])
@@ -1260,9 +1571,11 @@ def cmd_memory(args):
 
 # ------------------------------------------------ pr review
 
-# Project context is charged against this, not added on top of it — see cmd_pr. An 8k
-# model is already over budget at 60k chars of diff; context must not make that worse.
+# Project context, the ticket and the PR description are all charged against this, not
+# added on top of it — see run_pr_review. An 8k model is already over budget at 60k chars
+# of diff; nothing injected may make that worse.
 MAX_DIFF_CHARS = 60_000
+MAX_PR_BODY_CHARS = 1_500    # ceiling on the PR description put ahead of the diff
 
 def git_working_diff(root=None):
     """(diff, source) from staged then unstaged changes, or (None, None). The UI calls
@@ -1278,18 +1591,60 @@ def git_working_diff(root=None):
             pass
     return None, None
 
+PR_FIELDS = "number,title,body,url,headRefName,baseRefName,isDraft"
+
+# `focus pr fetch` is a deliberate act and can afford to wait; the fallback tier fires
+# when the user typed nothing but `focus pr`, and must not sit there for a minute.
+GH_TIMEOUT = 30
+GH_FALLBACK_TIMEOUT = 10
+
+def gh_pr_meta(root=None, number=None, timeout=GH_TIMEOUT):
+    """(meta dict, reason) for a PR — the one named, or the current branch's."""
+    argv = ["pr", "view"] + ([str(number)] if number else []) + ["--json", PR_FIELDS]
+    out, reason = _gh(argv, cwd=root, timeout=timeout)
+    if reason:
+        return None, reason
+    try:
+        return json.loads(out), ""
+    except json.JSONDecodeError:
+        return None, "Couldn't read the PR details GitHub CLI returned."
+
+def gh_pr_diff(root=None, number=None, timeout=GH_TIMEOUT):
+    """(diff, meta, reason). Metadata is fetched first: it names the session and gives
+    the review the description the author already wrote. `pr_source()` turns the meta
+    into the session's source label, so that string lives in one place."""
+    meta, reason = gh_pr_meta(root, number, timeout)
+    if not meta:
+        return None, None, reason
+    diff, reason = _gh(["pr", "diff", str(meta["number"])], cwd=root, timeout=timeout)
+    if not diff.strip():
+        return None, None, reason or f"PR #{meta['number']} has an empty diff."
+    return diff, meta, ""
+
+def pr_source(meta):
+    return f"PR #{meta['number']}"
+
 def get_diff(args):
+    """(diff, source, pr_meta). Tiers, first hit wins — the PR sits *below* the working
+    tree on purpose: uncommitted changes are what you're in the middle of, and pulling
+    the PR instead would silently review something else. A clean tree is the "I pushed,
+    now review it" moment, and that's where the auto-fetch lands."""
     if args.file:
         with open(args.file, encoding="utf-8", errors="replace") as f:
-            return f.read(), os.path.basename(args.file)
+            return f.read(), os.path.basename(args.file), None
     if not sys.stdin.isatty():
-        return sys.stdin.read(), "stdin"
+        return sys.stdin.read(), "stdin", None
     diff, source = git_working_diff()
     if diff:
-        return diff, source
+        return diff, source, None
+    diff, meta, reason = gh_pr_diff(project_root(), timeout=GH_FALLBACK_TIMEOUT)
+    if diff:
+        return diff, pr_source(meta), meta
     raise SystemExit(
-        "No diff found. Pipe one in (`gh pr diff 123 | focus pr`), use -f file.diff,\n"
-        "or run inside a repo with staged/unstaged changes."
+        "No diff found — nothing staged or unstaged here, and no PR to fall back on\n"
+        f"  ({reason})\n"
+        "  Pipe one in (`git diff main | focus pr`), use -f file.diff, or name a PR\n"
+        "  with `focus pr fetch 123`."
     )
 
 def pr_session_path(name):
@@ -1303,21 +1658,44 @@ def _pr_action(args):
         return "check", args.check
     if args.action == "resume" or args.resume:
         return "resume", None
+    if args.action == "fetch":
+        return "fetch", args.n
     return "review", None
 
-def run_pr_review(diff, source, name=None, project=None, no_project=False):
+def _pr_preamble(meta):
+    """The PR's own title and description, ahead of the diff. Cheap, high-signal context
+    the author already wrote — and the thing the diff is supposed to deliver."""
+    if not meta:
+        return ""
+    head = f"PULL REQUEST #{meta.get('number')}: {meta.get('title', '')}".strip()
+    body = _clip((meta.get("body") or "").strip(), MAX_PR_BODY_CHARS)
+    branch, base = meta.get("headRefName", ""), meta.get("baseRefName", "")
+    line = f"{branch} -> {base}" if branch and base else ""
+    return "\n".join(x for x in (head, line, body) if x) + "\n\nDIFF:\n"
+
+def run_pr_review(diff, source, name=None, project=None, no_project=False,
+                  pr_meta=None, story=None, no_ticket=False):
     """Resolve context, charge it against the diff budget, ask the model, save the
     session. Shared by cmd_pr and the UI's /api/pr — never prints, never SystemExits."""
     # Resolve context first, then charge it to the diff's budget so the request never
     # grows. Keyed on the paths the diff touches, so only relevant sections survive.
     ctx, ctx_source = resolve_project_context(
-        diff_paths(diff), MAX_CONTEXT_CHARS, project, no_project)
+        diff_paths(diff), budget=MAX_CONTEXT_CHARS, name=project, disabled=no_project)
+    # The ticket is the one thing a diff can't tell you: what it was *asked* to do. This
+    # is the only injection site that refreshes over the network — a review is already a
+    # deliberate, slow act, and a stale acceptance criterion is worse here than anywhere.
+    ticket, ticket_info = resolve_ticket_context(
+        budget=MAX_TICKET_CHARS, story=story, disabled=no_ticket, pr_meta=pr_meta,
+        refresh=True)
+    preamble = _pr_preamble(pr_meta)
     truncated = False
-    if len(diff) > MAX_DIFF_CHARS - len(ctx):
-        diff = diff[:MAX_DIFF_CHARS - len(ctx)]
+    budget = MAX_DIFF_CHARS - len(ctx) - len(ticket) - len(preamble)
+    if len(diff) > budget:
+        diff = diff[:budget]
         truncated = True
-    data = ask_model(SYS_PR + project_block(ctx), diff)
-    name = name or datetime.now().strftime("pr-%Y%m%d-%H%M")
+    data = ask_model(SYS_PR + project_block(ctx) + ticket_block(ticket), preamble + diff)
+    name = name or (f"pr-{pr_meta['number']}" if pr_meta
+                    else datetime.now().strftime("pr-%Y%m%d-%H%M"))
     session = {
         "name": name,
         "source": source,
@@ -1326,6 +1704,10 @@ def run_pr_review(diff, source, name=None, project=None, no_project=False):
         "risks": data.get("risks", []),
         "truncated": truncated,
         "project": {"source": ctx_source, "chars": len(ctx)} if ctx else None,
+        "pr": {"number": pr_meta["number"], "title": pr_meta.get("title", ""),
+               "url": pr_meta.get("url", ""), "branch": pr_meta.get("headRefName", ""),
+               "draft": pr_meta.get("isDraft", False)} if pr_meta else None,
+        "ticket": dict(ticket_info, chars=len(ticket)) if ticket_info else None,
         "checklist": [
             {"file": c.get("file", "?"), "item": c.get("item", ""), "done": False}
             for c in data.get("checklist", [])
@@ -1336,12 +1718,21 @@ def run_pr_review(diff, source, name=None, project=None, no_project=False):
 
 def cmd_pr(args):
     action, item = _pr_action(args)
-    if action != "review":
+    if action in ("resume", "check"):
         if action == "check" and item is None:
             raise SystemExit("Which item? `focus pr check 3`")
         return cmd_pr_resume(args, item)
-    diff, source = get_diff(args)
-    session = run_pr_review(diff, source, args.name, args.project, args.no_project)
+    if action == "fetch":
+        # Asked for by name, so say why it failed rather than falling through quietly.
+        diff, pr_meta, reason = gh_pr_diff(project_root(), item)
+        if not diff:
+            raise SystemExit(reason or "Couldn't fetch that pull request.")
+        source = pr_source(pr_meta)
+    else:
+        diff, source, pr_meta = get_diff(args)
+    session = run_pr_review(diff, source, name=args.name, project=args.project,
+                            no_project=args.no_project, pr_meta=pr_meta,
+                            story=args.story, no_ticket=args.no_ticket)
     print_pr(session)
     print(f"Saved as '{session['name']}'. After any interruption: focus pr resume")
 
@@ -1365,9 +1756,19 @@ def latest_session():
 
 def print_pr(s):
     print(f"\nPR REVIEW: {s['name']}  (from {s['source']})")
+    if s.get("pr"):
+        pr = s["pr"]
+        draft = " [draft]" if pr.get("draft") else ""
+        print(f"  #{pr['number']} {pr['title']}{draft}")
+        if pr.get("url"):
+            print(f"  {pr['url']}")
     if s.get("project"):
         print(f"  project context: {s['project']['source']} "
               f"({s['project']['chars']} chars)")
+    if s.get("ticket"):
+        t = s["ticket"]
+        print(f"  ticket: sc-{t['id']} {t.get('name', '')} "
+              f"(via {t.get('how', '?')}, {t['chars']} chars)")
     print("-" * 56)
     print("WHAT IT DOES:\n" + textwrap.fill(s["summary"], 72, initial_indent="  ",
                                             subsequent_indent="  "))
@@ -1419,6 +1820,7 @@ def cmd_draft(args):
     system = ("\n".join([SYS_DRAFT, style, tone, to])
               + voice_system_suffix(args.no_voice)
               + project_system_suffix(text, BRIEF_CONTEXT_CHARS, disabled=args.no_project)
+              + ticket_system_suffix(disabled=args.no_ticket)
               + memory_system_suffix(args.no_memory, args.no_project))
     if args.polish:
         user = "Polish this draft, keep my meaning and roughly my voice:\n\n" + text
@@ -1623,6 +2025,93 @@ def cmd_project(args):
     print(f"\nSaved. Every AI command now knows this repo — `focus project edit` to "
           f"correct it, `--no-project` to skip it.")
 
+# ------------------------------------------------ shortcut
+
+def _print_story(s, how=""):
+    print(f"\nTICKET: sc-{s['id']} — {s.get('name', '')}")
+    if how:
+        print(f"  found via {how}")
+    if s.get("url"):
+        print("  " + s["url"])
+    print(f"  fetched {s.get('fetched', '?')}\n")
+    print(textwrap.indent(_clip(s.get("text", ""), MAX_TICKET_CHARS), "  "))
+
+def cmd_shortcut(args):
+    sid = args.n
+    if args.action == "token":
+        # Read from stdin, never argv — a token in a command line is a token in your
+        # shell history and in `ps`.
+        token = read_multiline("", "Paste your Shortcut API token").strip()
+        if not token:
+            raise SystemExit("No token given — nothing saved.")
+        save_shortcut_token(token)
+        print(f"Saved to {shortcut_config_path()} (mode 600).")
+        print("Now: `focus shortcut use 12345`, or just name branches `sc-12345/...`.")
+        return
+    if args.action in ("on", "off"):
+        on = args.action == "on"
+        set_ticket_enabled(on, args.here)
+        where = f"for '{project_key()}'" if args.here else "everywhere"
+        print(f"Ticket context {'back on' if on else 'off'} {where}.")
+        if not on:
+            print("Your token and cached tickets are kept. Back on: `focus shortcut on`"
+                  + (" --here" if args.here else ""))
+        return
+    if args.action == "ls":
+        ids = cached_story_ids()
+        if not ids:
+            print("No tickets cached yet. `focus shortcut use 12345`.")
+            return
+        pins = load_ticket_repo().get("branches") or {}
+        here, _ = detect_story_id()
+        print("\nCACHED TICKETS:")
+        for i in ids:
+            s = load_story(i)
+            mark = "  <- here" if here == i else ""
+            print(f"  sc-{i}  {s.get('name', '?')[:60]}{mark}")
+        if pins:
+            print("\nPINNED IN THIS REPO:")
+            for branch, pin in sorted(pins.items()):
+                print(f"  {branch} -> sc-{pin}")
+        return
+    if args.action == "clear":
+        ids = clear_story_cache()
+        had_token = bool(load_shortcut_config().get("token"))
+        save_shortcut_config({})
+        print(f"Cleared {len(ids)} cached ticket(s)"
+              + (" and the saved token." if had_token else "."))
+        return
+    if args.action == "use":
+        if not sid:
+            raise SystemExit("Which story? `focus shortcut use 12345`")
+        story = fetch_story(str(sid))
+        branch = pin_story(sid)
+        _print_story(story, f"pinned to {branch}" if branch else "given")
+        print("\nEvery dump/break/draft/pr in this repo now knows it.")
+        return
+    if args.action == "fetch":
+        detected, how = detect_story_id(sid)
+        if not detected:
+            raise SystemExit(
+                "No story to refresh. Name one (`focus shortcut fetch 12345`), pin one\n"
+                "  (`focus shortcut use 12345`), or work on an `sc-12345` branch.")
+        _print_story(fetch_story(detected), how)
+        return
+    # show
+    detected, how = detect_story_id(sid)
+    if not detected:
+        print("No ticket for this branch.")
+        print("  focus shortcut use 12345   pin one to this branch")
+        print("  ...or name branches `sc-12345/thing`, and focus finds them itself.")
+        return
+    s = load_story(detected)
+    if not s.get("text"):
+        print(f"Found sc-{detected} (via {how}) but it isn't cached yet.")
+        print(f"  focus shortcut fetch {detected}")
+        return
+    _print_story(s, how)
+    print("\n  Refresh: focus shortcut fetch · silence it: focus shortcut off --here")
+
 # ------------------------------------------------ doctor
 
 def cmd_doctor(args):
@@ -1653,6 +2142,29 @@ def repo_state(recent=False):
                           "git": is_git_repo(r)}
                          for r in load_ui_prefs().get("recent", []) if os.path.isdir(r)]
     return out
+
+def shortcut_state():
+    """Everything the Shortcut panel renders. Off the 5-second poll on purpose: resolving
+    a ticket needs the current branch, which changes without the repo root changing and so
+    can't ride _ROOT_CACHE. The panel asks when it opens instead."""
+    cfg = load_shortcut_config()
+    repo = load_ticket_repo()
+    root = project_root()
+    branch = current_branch(root)          # resolved once, then handed to detection
+    sid, how = detect_story_id(root=root, repo=repo)
+    s = load_story(sid) if sid else {}
+    return {
+        "branch": branch,
+        "has_token": bool(shortcut_token(cfg)),
+        "env_token": bool(os.environ.get("SHORTCUT_API_TOKEN")),
+        "disabled": bool(cfg.get("disabled")),
+        "disabled_here": bool(repo.get("disabled")),
+        "id": sid, "how": how, "url": s.get("url", ""),
+        "text": _clip(s.get("text", ""), MAX_TICKET_CHARS),
+        "fetched": s.get("fetched", ""),
+        "cached": cached_story_ids(),
+        "pins": repo.get("branches") or {},
+    }
 
 def browse_dirs(path):
     """Subdirectories of `path`, for the repo picker. Raises OSError if unreadable.
@@ -1802,6 +2314,8 @@ class UIHandler(BaseHTTPRequestHandler):
                 system = SYS_BREAK + project_system_suffix(
                     context, BRIEF_CONTEXT_CHARS,
                     disabled=body.get("no_project", False)) \
+                    + ticket_system_suffix(story=body.get("story"),
+                                           disabled=body.get("no_ticket", False)) \
                     + memory_system_suffix(body.get("no_memory", False),
                                            body.get("no_project", False))
                 data = ask_model(system, context)
@@ -1820,6 +2334,8 @@ class UIHandler(BaseHTTPRequestHandler):
                     system = SYS_DUMP + project_system_suffix(
                         body["text"], BRIEF_CONTEXT_CHARS,
                         disabled=body.get("no_project", False)) \
+                        + ticket_system_suffix(
+                            disabled=body.get("no_ticket", False)) \
                         + memory_system_suffix(body.get("no_memory", False),
                                                body.get("no_project", False))
                     data = ask_model(system, body["text"])
@@ -1847,6 +2363,7 @@ class UIHandler(BaseHTTPRequestHandler):
                     voice_system_suffix(body.get("no_voice", False)) + \
                     project_system_suffix(body["text"], BRIEF_CONTEXT_CHARS,
                                           disabled=body.get("no_project", False)) + \
+                    ticket_system_suffix(disabled=body.get("no_ticket", False)) + \
                     memory_system_suffix(body.get("no_memory", False),
                                          body.get("no_project", False))
                 prefix = ("Polish this draft, keep my meaning and roughly my voice:\n\n"
@@ -2029,21 +2546,62 @@ class UIHandler(BaseHTTPRequestHandler):
                 elif action != "show":
                     return self._send(400, {"error": "bad action"})
                 self._send(200, repo_state(recent=True))
+            elif self.path == "/api/shortcut":
+                # POST, like every other route here, so _origin_ok covers it — this one
+                # accepts an API token, and must never be reachable cross-origin.
+                action = body.get("action", "show")
+                if action == "token":
+                    token = (body.get("token") or "").strip()
+                    if not token:
+                        return self._send(400, {"error": "No token given."})
+                    save_shortcut_token(token)
+                elif action == "use":
+                    sid = str(body.get("n") or "").strip()
+                    if not sid:
+                        return self._send(400, {"error": "Which story?"})
+                    fetch_story(sid)
+                    pin_story(sid)
+                elif action == "fetch":
+                    sid, _ = detect_story_id(body.get("n") or None)
+                    if not sid:
+                        return self._send(400, {"error": "No ticket to refresh."})
+                    fetch_story(sid)
+                elif action in ("on", "off"):
+                    set_ticket_enabled(action == "on", body.get("here", False))
+                elif action == "clear":
+                    clear_story_cache()
+                    save_shortcut_config({})
+                elif action != "show":
+                    return self._send(400, {"error": "bad action"})
+                self._send(200, shortcut_state())
             elif self.path == "/api/pr":
                 action = body.get("action", "review")
-                if action == "review":
-                    diff = body.get("diff") or ""
-                    if diff.strip():
-                        source = "ui paste"
-                    else:
-                        diff, source = git_working_diff(project_root())
+                if action in ("review", "fetch"):
+                    pr_meta = None
+                    if action == "fetch":
+                        diff, pr_meta, reason = gh_pr_diff(project_root(),
+                                                           body.get("n") or None)
                         if not diff:
-                            return self._send(400, {"error":
-                                "No diff. Paste one, or stage changes in "
-                                + project_root() + "."})
+                            return self._send(400, {"error": reason})
+                        source = pr_source(pr_meta)
+                    else:
+                        # No PR tier here, unlike the CLI: `gh` is two subprocesses on a
+                        # server thread, and the panel has an explicit button for it.
+                        diff = body.get("diff") or ""
+                        source = "ui paste"
+                        if not diff.strip():
+                            diff, source = git_working_diff(project_root())
+                            if not diff:
+                                return self._send(400, {"error":
+                                    "No diff. Paste one, stage changes in "
+                                    + project_root()
+                                    + ", or use Review this branch's PR."})
                     session = run_pr_review(
-                        diff, source, body.get("name") or None,
-                        body.get("project") or None, body.get("no_project", False))
+                        diff, source, name=body.get("name") or None,
+                        project=body.get("project") or None,
+                        no_project=body.get("no_project", False), pr_meta=pr_meta,
+                        story=body.get("story") or None,
+                        no_ticket=body.get("no_ticket", False))
                     return self._send(200, session)
                 if action not in ("resume", "check"):
                     return self._send(400, {"error": "bad action"})
@@ -2066,7 +2624,7 @@ class UIHandler(BaseHTTPRequestHandler):
                 self._send(404, {"error": "not found"})
         except NoModelError as e:
             self._send(503, {"error": str(e)})
-        except ModelReplyError as e:
+        except (ModelReplyError, TicketError) as e:
             self._send(502, {"error": str(e)})
         except SystemExit as e:  # a CLI-shaped helper leaked; don't kill the thread
             self._send(500, {"error": f"unexpected exit: {e}"})
@@ -2289,11 +2847,18 @@ background:var(--green-soft);border-radius:999px;padding:1px 8px;}
       <input type="text" id="prName" placeholder="session name (optional)" style="width:180px">
       <button class="primary" id="prPasteBtn" onclick="doPr('paste')">Review pasted diff</button>
       <button id="prGitBtn" onclick="doPr('git')">Review changes in repo</button>
+      <button id="prFetchBtn" onclick="doPr('fetch')">Review this branch's PR</button>
       <button onclick="doPr('resume')">Resume last session</button>
       <label class="muted" style="cursor:pointer"><input type="checkbox" id="prNoProject"> skip project context</label>
+      <label class="muted" style="cursor:pointer"><input type="checkbox" id="prNoTicket"> skip ticket</label>
       <span class="muted" id="prStatus"></span>
     </div>
     <div id="prOut"></div>
+  </details>
+
+  <details class="panel" id="shortcutPanel">
+    <summary>Ticket <span class="muted" id="shortcutSummary">the Shortcut story behind this work</span></summary>
+    <div id="shortcutBody" class="muted">open to load…</div>
   </details>
 
   <details class="panel" id="voicePanel">
@@ -2346,6 +2911,7 @@ async function refresh(){
   document.getElementById("prPasteBtn").disabled=!state.llm;
   document.getElementById("prGitBtn").disabled=!state.llm||!repo.git;
   document.getElementById("prGitBtn").textContent="Review changes in "+(state.root||"repo");
+  document.getElementById("prFetchBtn").disabled=!state.llm||!repo.git;
   renderOne();renderBoard();renderDone();renderTriage();renderSettings();
 }
 // one toggle for every AI panel — project context is a property of the repo, not the panel
@@ -2467,6 +3033,9 @@ function renderBoard(){
 }
 function addBtn(parent,label,fn){const b=document.createElement("button");
   b.textContent=label;b.onclick=fn;parent.appendChild(b);}
+function addLink(parent,url){if(!url)return;const a=document.createElement("a");
+  a.href=url;a.target="_blank";a.rel="noopener";a.textContent=" ↗";
+  a.style.marginLeft="4px";parent.appendChild(a);}
 function lastNote(t){const n=(t.notes||"").trim();if(!n)return"";
   const ls=n.split("\n");return ls[ls.length-1];}
 function esc(s){return s.replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
@@ -2529,7 +3098,7 @@ function renderTriage(){
 let prName=null;
 async function doPr(mode){
   const s=document.getElementById("prStatus");
-  const body={action:mode==="resume"?"resume":"review",
+  const body={action:mode==="resume"?"resume":(mode==="fetch"?"fetch":"review"),
     name:document.getElementById("prName").value.trim()};
   if(mode==="paste"){
     const d=document.getElementById("prDiff").value;
@@ -2538,7 +3107,9 @@ async function doPr(mode){
   }
   if(mode!=="resume"){
     body.no_project=document.getElementById("prNoProject").checked;
-    s.textContent="reviewing… (local models take a minute)";
+    body.no_ticket=document.getElementById("prNoTicket").checked;
+    s.textContent=mode==="fetch"?"fetching the PR, then reviewing…"
+      :"reviewing… (local models take a minute)";
   }
   try{const r=await api("/api/pr",body);s.textContent="";renderPr(r);
     document.getElementById("prOut").scrollIntoView({behavior:"smooth",block:"nearest"});}
@@ -2554,8 +3125,15 @@ function renderPr(sn){
   const head=document.createElement("div");head.className="muted";
   head.style.marginTop="10px";
   head.textContent=sn.name+" · from "+sn.source+
-    (sn.project?" · context: "+sn.project.source+" ("+sn.project.chars+" chars)":"");
+    (sn.project?" · context: "+sn.project.source+" ("+sn.project.chars+" chars)":"")+
+    (sn.ticket?" · ticket sc-"+sn.ticket.id+" (via "+sn.ticket.how+")":"");
   o.appendChild(head);
+  if(sn.pr){
+    const p=document.createElement("div");p.className="muted";
+    p.textContent="#"+sn.pr.number+" "+sn.pr.title+(sn.pr.draft?" [draft]":"");
+    addLink(p,sn.pr.url);
+    o.appendChild(p);
+  }
   const sum=document.createElement("pre");sum.className="out";
   sum.textContent=sn.summary;o.appendChild(sum);
   if(sn.truncated){const w=document.createElement("div");w.className="warn";
@@ -2844,6 +3422,81 @@ function renderProject(p,projects){
     el.appendChild(ul);
   }
 }
+// --- shortcut ticket
+async function loadShortcut(){
+  try{renderShortcut(await api("/api/shortcut",{action:"show"}));}
+  catch(e){document.getElementById("shortcutSummary").textContent=e.message;}
+}
+async function doShortcut(body,confirmMsg){
+  if(confirmMsg&&!confirm(confirmMsg))return;
+  const s=document.getElementById("shortcutSummary");
+  s.textContent="talking to Shortcut…";
+  try{renderShortcut(await api("/api/shortcut",body));}
+  catch(e){s.textContent=e.message;}
+}
+function renderShortcut(t){
+  const el=document.getElementById("shortcutBody"),
+    s=document.getElementById("shortcutSummary");
+  const off=t.disabled||t.disabled_here;
+  s.textContent=off?"off"+(t.disabled_here&&!t.disabled?" for this repo":"")
+    :(t.id?"sc-"+t.id+" via "+t.how:"no ticket for "+(t.branch||"this branch"));
+  el.innerHTML="";el.className="";
+  if(!t.has_token){
+    const w=document.createElement("div");w.className="warn";
+    w.textContent="No Shortcut token yet — paste one below to fetch tickets. "+
+      "It is stored in ~/.focus/shortcut.json, mode 600, and never leaves this machine.";
+    el.appendChild(w);
+  }
+  if(t.text){
+    const pre=document.createElement("pre");pre.className="out";
+    pre.textContent=t.text;el.appendChild(pre);
+    const meta=document.createElement("div");meta.className="muted";
+    meta.textContent="sc-"+t.id+" · found via "+t.how+" · fetched "+
+      (t.fetched||"?").slice(0,10);
+    addLink(meta,t.url);
+    el.appendChild(meta);
+  }else if(t.id){
+    const d=document.createElement("div");d.className="muted";
+    d.textContent="sc-"+t.id+" found via "+t.how+", but not fetched yet.";
+    el.appendChild(d);
+  }
+  const row=document.createElement("div");row.className="row";
+  const idIn=document.createElement("input");idIn.type="text";
+  idIn.placeholder="story id, e.g. 12345";idIn.style.width="150px";
+  row.appendChild(idIn);
+  addBtn(row,"Pin to this branch",()=>{
+    if(!idIn.value.trim()){s.textContent="which story?";return;}
+    doShortcut({action:"use",n:idIn.value.trim()});});
+  if(t.id)addBtn(row,"Refresh",()=>doShortcut({action:"fetch"}));
+  addBtn(row,off?"Turn ticket context on":"Turn it off",
+    ()=>doShortcut({action:off?"on":"off"}));
+  el.appendChild(row);
+  const ed=document.createElement("details");ed.className="sub";
+  ed.innerHTML="<summary>API token</summary>";
+  const ti=document.createElement("input");ti.type="password";
+  ti.placeholder=t.env_token?"set from SHORTCUT_API_TOKEN":
+    (t.has_token?"saved — paste a new one to replace":"paste your Shortcut API token");
+  ti.style.width="320px";ed.appendChild(ti);
+  const trow=document.createElement("div");trow.className="row";
+  addBtn(trow,"Save token",()=>{
+    if(!ti.value.trim())return;
+    doShortcut({action:"token",token:ti.value.trim()});ti.value="";});
+  addBtn(trow,"Forget everything",()=>doShortcut({action:"clear"},
+    "Delete the saved token and every cached ticket?"));
+  ed.appendChild(trow);el.appendChild(ed);
+  if((t.cached||[]).length){
+    const h=document.createElement("div");h.className="muted";
+    h.style.marginTop="8px";h.textContent="Cached tickets:";el.appendChild(h);
+    const ul=document.createElement("ul");ul.className="facts";
+    const pins=t.pins||{};
+    const byId={};for(const b in pins){(byId[pins[b]]=byId[pins[b]]||[]).push(b);}
+    for(const c of t.cached){const li=document.createElement("li");
+      li.textContent="sc-"+c+(byId[c]?" — "+byId[c].join(", "):"")+
+        (c===t.id?" ← here":"");
+      ul.appendChild(li);}
+    el.appendChild(ul);
+  }
+}
 // --- doctor
 function renderSettings(){
   const el=document.getElementById("settingsBody");
@@ -2858,6 +3511,7 @@ function renderSettings(){
 document.getElementById("voicePanel").addEventListener("toggle",e=>{if(e.target.open)loadVoice();});
 document.getElementById("memoryPanel").addEventListener("toggle",e=>{if(e.target.open)loadMemory();});
 document.getElementById("projectPanel").addEventListener("toggle",e=>{if(e.target.open)loadProject();});
+document.getElementById("shortcutPanel").addEventListener("toggle",e=>{if(e.target.open)loadShortcut();});
 // Timer state lives in localStorage as an end-timestamp, so a reload (or closing the
 // tab mid-pomodoro) never loses a running timer.
 let timer=null;
@@ -2906,6 +3560,8 @@ refresh();setInterval(refresh,5000);
 
 NO_PROJECT_HELP = "ignore this repo's project context"
 NO_MEMORY_HELP = "ignore your memory facts for this command"
+NO_TICKET_HELP = "ignore the Shortcut ticket for this command"
+STORY_HELP = "Shortcut story id to use, or 'none' to skip the ticket"
 
 def main(argv=None):
     p = argparse.ArgumentParser(prog="focus",
@@ -2916,6 +3572,7 @@ def main(argv=None):
     s.add_argument("text", nargs="*")
     s.add_argument("--no-project", action="store_true", help=NO_PROJECT_HELP)
     s.add_argument("--no-memory", action="store_true", help=NO_MEMORY_HELP)
+    s.add_argument("--no-ticket", action="store_true", help=NO_TICKET_HELP)
     s.set_defaults(fn=cmd_dump)
 
     s = sub.add_parser("add", help="add one task (no AI)")
@@ -2937,6 +3594,8 @@ def main(argv=None):
     s.add_argument("--hint", nargs="*", help="extra context for the model")
     s.add_argument("--no-project", action="store_true", help=NO_PROJECT_HELP)
     s.add_argument("--no-memory", action="store_true", help=NO_MEMORY_HELP)
+    s.add_argument("--no-ticket", action="store_true", help=NO_TICKET_HELP)
+    s.add_argument("--story", help=STORY_HELP)
     s.set_defaults(fn=cmd_break)
 
     s = sub.add_parser("next", help="show exactly one next action")
@@ -2975,12 +3634,16 @@ def main(argv=None):
 
     s = sub.add_parser("pr", help="summarise a diff + review checklist")
     s.add_argument("action", nargs="?", default="review",
-                   choices=["review", "resume", "check"],
-                   help="review a diff (default), resume the last one, or check N")
-    s.add_argument("n", nargs="?", type=int, help="item number, for `focus pr check N`")
+                   choices=["review", "resume", "check", "fetch"],
+                   help="review a diff (default), fetch this branch's PR, "
+                        "resume the last one, or check N")
+    s.add_argument("n", nargs="?", type=int,
+                   help="item number for `check N`, PR number for `fetch N`")
     s.add_argument("-f", "--file", help="read diff from file")
     s.add_argument("--name", help="session name")
     s.add_argument("--project", help="project profile to use, or 'none' to skip context")
+    s.add_argument("--no-ticket", action="store_true", help=NO_TICKET_HELP)
+    s.add_argument("--story", help=STORY_HELP)
     # pre-verb spellings, still honoured so nothing anyone has typed before breaks
     s.add_argument("--resume", action="store_true", help=argparse.SUPPRESS)
     s.add_argument("--check", type=int, help=argparse.SUPPRESS)
@@ -2998,6 +3661,7 @@ def main(argv=None):
                    help="ignore your voice profile for this draft")
     s.add_argument("--no-project", action="store_true", help=NO_PROJECT_HELP)
     s.add_argument("--no-memory", action="store_true", help=NO_MEMORY_HELP)
+    s.add_argument("--no-ticket", action="store_true", help=NO_TICKET_HELP)
     s.set_defaults(fn=cmd_draft)
 
     s = sub.add_parser("voice", help="teach drafts to sound like you")
@@ -3022,6 +3686,16 @@ def main(argv=None):
     s.add_argument("--project", help="act on this profile name, not the detected one")
     s.set_defaults(fn=cmd_project)
 
+    s = sub.add_parser("shortcut", help="pull Shortcut tickets into the AI features")
+    s.add_argument("action", nargs="?", default="show",
+                   choices=["show", "use", "fetch", "token", "ls", "on", "off", "clear"],
+                   help="show this branch's ticket (default), pin one with `use N`, "
+                        "refresh it, save a token, list, or turn injection on/off")
+    s.add_argument("n", nargs="?", type=int, help="story id, for `use` and `fetch`")
+    s.add_argument("--here", action="store_true",
+                   help="act on this repo only, not everywhere")
+    s.set_defaults(fn=cmd_shortcut)
+
     s = sub.add_parser("ui", help="open the local dashboard")
     s.add_argument("--port", type=int, default=8765)
     s.add_argument("--no-browser", action="store_true")
@@ -3036,7 +3710,7 @@ def main(argv=None):
         return 0
     try:
         args.fn(args)
-    except (NoModelError, ModelReplyError) as e:
+    except (NoModelError, ModelReplyError, TicketError) as e:
         print(str(e), file=sys.stderr)
         return 2
     return 0

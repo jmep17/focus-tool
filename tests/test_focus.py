@@ -1,4 +1,5 @@
 """End-to-end tests for focus.py against a mock local model. Run: python3 tests/test_focus.py"""
+import argparse
 import io
 import json
 import os
@@ -434,6 +435,17 @@ def api_status(path, payload):
     except urllib.error.HTTPError as e:
         return e.code
 
+def forged_post(path, payload):
+    """Status of a cross-origin POST — _origin_ok should make every one of them 403."""
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{ui_port}{path}", data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", "Origin": "http://evil.example"})
+    try:
+        urllib.request.urlopen(req, timeout=10)
+        return 200
+    except urllib.error.HTTPError as e:
+        return e.code
+
 # --- UI: state extensions (doctor detail, energy, week, calibration)
 state = json.loads(api("/api/state")[1])
 check("state exposes model detail", state["model"]["model"] == "mock-model-8b", state)
@@ -581,26 +593,219 @@ check("a non-repo folder still resolves a project key",
 r = json.loads(api("/api/repo", {"action": "use", "path": os.path.join(REPO, "tests")})[1])
 check("ui repo use on a subdirectory selects the repo", r["root"] == REPO, r)
 
-req = urllib.request.Request(
-    f"http://127.0.0.1:{ui_port}/api/add",
-    data=json.dumps({"title": "evil"}).encode(),
-    headers={"Content-Type": "application/json", "Origin": "http://evil.example"})
+check("cross-origin POST rejected", forged_post("/api/add", {"title": "evil"}) == 403)
+check("cross-origin POST to voice rejected",
+      forged_post("/api/voice", {"action": "off"}) == 403)
+
+# --- gh: pulling the branch's own PR
+# A shim on PATH is the whole seam — focus reaches GitHub only by shelling out to gh.
+BIN = os.path.join(TMP, "bin")
+os.makedirs(BIN, exist_ok=True)
+with open(os.path.join(BIN, "gh"), "w") as f:
+    f.write('#!/bin/sh\nexec "%s" "%s" "$@"\n'
+            % (sys.executable, os.path.join(HERE, "fake_gh.py")))
+os.chmod(os.path.join(BIN, "gh"), 0o755)
+EMPTY_BIN = os.path.join(TMP, "empty-bin")
+os.makedirs(EMPTY_BIN, exist_ok=True)
+# The fake gh stays on PATH for the rest of the file — the Shortcut and UI blocks below
+# use it too. Only the "no gh at all" check swaps it out, and puts it straight back.
+GH_PATH = BIN + os.pathsep + os.environ["PATH"]
+os.environ["PATH"] = GH_PATH
+
+# The tier order is the decision worth pinning: uncommitted work outranks the PR, so
+# `focus pr` keeps reviewing what you're in the middle of. Patch the working-tree tier
+# rather than dirtying the checkout, so the result doesn't depend on the developer's tree.
+real_working = focus.git_working_diff
+piped_stdin = sys.stdin
+pr_args = argparse.Namespace(file=None)
+
+class _Tty(io.StringIO):
+    """get_diff reads piped stdin before anything else, and the suite runs piped."""
+    def isatty(self):
+        return True
+
 try:
-    urllib.request.urlopen(req, timeout=10)
-    forged = 200
-except urllib.error.HTTPError as e:
-    forged = e.code
-check("cross-origin POST rejected", forged == 403, forged)
-req = urllib.request.Request(
-    f"http://127.0.0.1:{ui_port}/api/voice",
-    data=json.dumps({"action": "off"}).encode(),
-    headers={"Content-Type": "application/json", "Origin": "http://evil.example"})
+    sys.stdin = _Tty()
+    focus.git_working_diff = lambda root=None: ("LOCAL DIFF", "git diff HEAD")
+    d, src, meta = focus.get_diff(pr_args)
+    check("a dirty tree still outranks the PR", d == "LOCAL DIFF" and meta is None, src)
+    focus.git_working_diff = lambda root=None: (None, None)
+    d, src, meta = focus.get_diff(pr_args)
+    check("a clean tree falls through to the branch's PR",
+          "def retry" in d and src == "PR #4521", src)
+    check("the PR's own metadata comes back", meta["number"] == 4521, meta)
+
+    code, out = run(["pr", "fetch"])
+    check("pr fetch reviews the branch's PR", "retry logic" in out, out)
+    check("pr fetch names the session after the PR", "pr-4521" in out, out)
+    check("pr fetch shows the PR title", "Retry payments" in out, out)
+    s = focus.load_json(focus.pr_session_path("pr-4521"), None)
+    check("session records the PR", s["pr"]["number"] == 4521
+          and s["pr"]["branch"] == "jorden/retry-payments", s.get("pr"))
+    check("the PR description rides ahead of the diff",
+          "PULL REQUEST #4521" in mock_llm.SEEN_USER[-1], mock_llm.SEEN_USER[-1][:120])
+    code, out = run(["pr", "fetch", "4600"])
+    check("pr fetch N reviews that PR", "pr-4600" in out, out)
+
+    os.environ["FOCUS_TEST_GH"] = "nopr"
+    code, out = run(["pr", "fetch"])
+    check("pr fetch explains a missing PR",
+          code == 1 and "No pull request found" in out, (code, out))
+    code, out = run(["pr"])
+    check("with no diff and no PR, the old error still lands",
+          code == 1 and "No diff found" in out, (code, out))
+    os.environ.pop("FOCUS_TEST_GH")
+
+    os.environ["PATH"] = EMPTY_BIN
+    code, out = run(["pr", "fetch"])
+    check("pr fetch explains a missing gh",
+          code == 1 and "not installed" in out, (code, out))
+finally:
+    focus.git_working_diff = real_working
+    sys.stdin = piped_stdin
+    os.environ["PATH"] = GH_PATH
+    os.environ.pop("FOCUS_TEST_GH", None)
+
+# --- shortcut tickets
+import mock_shortcut  # noqa: E402
+sc_server, sc_port = mock_shortcut.start()
+with open(os.path.join(TMP, "shortcut.json"), "w") as f:
+    json.dump({"endpoint": f"http://127.0.0.1:{sc_port}"}, f)
+# ...and add the token the way a user would, so the 0600 write is the one under test
 try:
-    urllib.request.urlopen(req, timeout=10)
-    forged = 200
-except urllib.error.HTTPError as e:
-    forged = e.code
-check("cross-origin POST to voice rejected", forged == 403, forged)
+    sys.stdin = io.StringIO("sc-test-token\n")
+    code, out = run(["shortcut", "token"])
+finally:
+    sys.stdin = piped_stdin
+check("shortcut token saves", focus.shortcut_token() == "sc-test-token", out)
+mode = oct(os.stat(focus.shortcut_config_path()).st_mode)
+check("the token file is not world-readable", mode[-3:] == "600", mode)
+check("saving a token keeps the endpoint",
+      focus.shortcut_endpoint().endswith(str(sc_port)), focus.shortcut_endpoint())
+
+check("story ids are read from a branch name",
+      focus._story_id_in("jorden/sc-12345/retry") == "12345")
+check("story ids are read from a Shortcut url",
+      focus._story_id_in("see https://app.shortcut.com/acme/story/999/x") == "999")
+check("a bare number is not a story id", focus._story_id_in("fix 12345") is None)
+
+real_branch = focus.current_branch
+try:
+    focus.current_branch = lambda root=None: "jorden/sc-12345/retry"
+    sid, how = focus.detect_story_id()
+    check("branch names are a detection tier", (sid, how) == ("12345", "branch name"),
+          (sid, how))
+    focus.current_branch = lambda root=None: "no-ticket-here"
+    sid, how = focus.detect_story_id(pr_meta={"title": "x", "body": "closes sc-777"})
+    check("the PR description is a detection tier", (sid, how) == ("777", "PR description"),
+          (sid, how))
+    # The commit-log tier is a second git spawn, so only the callers that asked by name
+    # (pr, and the shortcut verbs) pay for it — dump/break/draft pass deep=False.
+    check("the everyday path skips the commit-log tier",
+          focus.detect_story_id(deep=False) == (None, ""),
+          focus.detect_story_id(deep=False))
+finally:
+    focus.current_branch = real_branch
+
+code, out = run(["shortcut", "use", "12345"])
+check("shortcut use fetches the story", "Retry payments on transient errors" in out, out)
+check("shortcut use shows the acceptance criteria", "no duplicate charges" in out, out)
+check("shortcut use pins it to this branch",
+      focus.load_ticket_repo()["branches"][focus.current_branch()] == "12345",
+      focus.load_ticket_repo())
+check("the token goes out as a header",
+      mock_shortcut.SEEN[-1][1] == "sc-test-token", mock_shortcut.SEEN[-1])
+
+code, out = run(["shortcut"])
+check("shortcut show finds the pinned ticket", "sc-12345" in out and "pinned to" in out, out)
+code, out = run(["shortcut", "ls"])
+check("shortcut ls lists the cache", "sc-12345" in out and "<- here" in out, out)
+
+requests_before = len(mock_shortcut.SEEN)
+code, out = run(["dump", "sort out the retry thing"])
+check("the ticket reaches a brain-dump", "TICKET CONTEXT" in mock_llm.SEEN[-1],
+      mock_llm.SEEN[-1][-300:])
+check("dump never hits the network for it",
+      len(mock_shortcut.SEEN) == requests_before, mock_shortcut.SEEN[requests_before:])
+check("the token never reaches the model", "sc-test-token" not in mock_llm.SEEN[-1])
+code, out = run(["dump", "sort out the retry thing", "--no-ticket"])
+check("--no-ticket suppresses it", "TICKET CONTEXT" not in mock_llm.SEEN[-1])
+code, out = run(["break", "1"])
+check("the ticket reaches a breakdown", "TICKET CONTEXT" in mock_llm.SEEN[-1])
+check("the ticket body comes with it", "duplicate charges" in mock_llm.SEEN[-1])
+code, out = run(["break", "1", "--story", "none"])
+check("--story none suppresses it", "TICKET CONTEXT" not in mock_llm.SEEN[-1])
+code, out = run(["draft", "can't make thursday"])
+check("the ticket reaches a draft", "TICKET CONTEXT" in mock_llm.SEEN[-1])
+
+requests_before = len(mock_shortcut.SEEN)
+code, out = run(["pr", "-f", diff_path, "--name", "ticket-pr"])
+check("the ticket reaches a review", "TICKET CONTEXT" in mock_llm.SEEN[-1])
+check("a review does refresh it", len(mock_shortcut.SEEN) > requests_before)
+s = focus.load_json(focus.pr_session_path("ticket-pr"), None)
+check("session records the ticket", s["ticket"]["id"] == "12345" and s["ticket"]["chars"],
+      s.get("ticket"))
+check("pr prints the ticket provenance", "ticket: sc-12345" in out, out)
+code, out = run(["pr", "-f", diff_path, "--no-ticket", "--name", "no-ticket-pr"])
+check("pr --no-ticket suppresses it", "TICKET CONTEXT" not in mock_llm.SEEN[-1])
+
+# context + ticket are charged AGAINST the diff budget, never added on top
+focus.save_project(pkey, {"profile": "## Stack\nfoo\n" + "y" * 8000})
+huge = diff + "x" * focus.MAX_DIFF_CHARS
+sess = focus.run_pr_review(huge, "test", "budget-pr")
+check("an oversized ticket still can't eat the diff budget", sess["truncated"] is True)
+# Everything variable — profile, ticket, PR preamble, diff — shares one budget. The two
+# fixed header strings are constants, not payload, so they come off before comparing.
+payload = (len(mock_llm.SEEN[-1]) - len(focus.SYS_PR) - len(focus.PROJECT_HEADER)
+           - len(focus.TICKET_HEADER) + len(mock_llm.SEEN_USER[-1]))
+check("context + ticket + diff share one budget rather than growing it",
+      payload <= focus.MAX_DIFF_CHARS, payload)
+check("the ticket was charged against the diff, not added to it",
+      len(mock_llm.SEEN_USER[-1]) <= focus.MAX_DIFF_CHARS - sess["ticket"]["chars"],
+      (len(mock_llm.SEEN_USER[-1]), sess["ticket"]["chars"]))
+
+code, out = run(["shortcut", "off"])
+check("shortcut off silences it", "off everywhere" in out, out)
+code, out = run(["dump", "anything"])
+check("a silenced ticket reaches nothing", "TICKET CONTEXT" not in mock_llm.SEEN[-1])
+code, out = run(["shortcut", "on"])
+code, out = run(["dump", "anything"])
+check("shortcut on brings it back", "TICKET CONTEXT" in mock_llm.SEEN[-1])
+code, out = run(["shortcut", "off", "--here"])
+code, out = run(["dump", "anything"])
+check("off --here silences just this repo", "TICKET CONTEXT" not in mock_llm.SEEN[-1])
+check("the global switch stayed on", not focus.load_shortcut_config().get("disabled"))
+run(["shortcut", "on", "--here"])
+
+# --- UI: ticket panel and PR fetch
+t = json.loads(api("/api/shortcut", {"action": "show"})[1])
+check("ui shortcut show resolves the ticket",
+      t["id"] == "12345" and "duplicate charges" in t["text"], t)
+check("ui shortcut reports a token without sending it back",
+      t["has_token"] is True and "sc-test-token" not in json.dumps(t), t)
+t = json.loads(api("/api/shortcut", {"action": "off"})[1])
+check("ui shortcut off disables", t["disabled"] is True, t)
+t = json.loads(api("/api/shortcut", {"action": "on"})[1])
+check("ui shortcut on re-enables", t["disabled"] is False, t)
+t = json.loads(api("/api/shortcut", {"action": "use", "n": 777})[1])
+check("ui shortcut use switches ticket", t["id"] == "777" and "rota" in t["text"], t)
+check("ui shortcut rejects a bad action",
+      api_status("/api/shortcut", {"action": "wat"}) == 400)
+check("ui shortcut rejects a missing story id",
+      api_status("/api/shortcut", {"action": "use"}) == 400)
+check("ui shortcut surfaces an unknown story as 502",
+      api_status("/api/shortcut", {"action": "fetch", "n": 999}) == 502)
+check("cross-origin POST to shortcut rejected",
+      forged_post("/api/shortcut", {"action": "token", "token": "stolen"}) == 403)
+
+s_pr = json.loads(api("/api/pr", {"action": "fetch", "name": "ui-fetch"})[1])
+check("ui pr fetch pulls the branch's PR",
+      s_pr["pr"]["number"] == 4521 and s_pr["source"] == "PR #4521", s_pr.get("pr"))
+check("ui html carries the new controls",
+      "prFetchBtn" in focus.UI_HTML and "shortcutPanel" in focus.UI_HTML)
+run(["shortcut", "clear"])
+check("shortcut clear empties the cache", not focus.cached_story_ids())
+check("shortcut clear forgets the token", not focus.load_shortcut_config().get("token"))
 
 # --- graceful no-model fallback: point config at a dead port
 with open(os.path.join(TMP, "config.json"), "w") as f:

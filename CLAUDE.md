@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-python3 tests/test_focus.py           # the whole test suite (~173 checks, no pytest)
+python3 tests/test_focus.py           # the whole test suite (~233 checks, no pytest)
 uv tool install --editable .          # install `focus` on PATH, running this folder live
 uv run --script focus.py <subcommand> # run without installing (PEP 723 header, zero deps)
 focus doctor                          # check which local model server is reachable
@@ -22,6 +22,15 @@ the tail of `tests/test_focus.py` instead. `FOCUS_HOME` is pointed at a temp dir
 `os.chdir` in that block belongs there too — project context resolves against the cwd, so
 without it the checks depend on where you invoked the suite from.
 
+The suite never touches the network, GitHub or Shortcut: `tests/mock_shortcut.py` is a
+loopback fake wired in through `shortcut.json`'s `endpoint` (the same config-injection
+trick that points the model client at `mock_llm`), and `tests/fake_gh.py` is put on `PATH`
+as `gh`, with `FOCUS_TEST_GH=nopr` selecting the no-PR case. Two things in the gh block are
+load-bearing: `sys.stdin` is swapped for a tty-shaped object, because `get_diff` reads
+piped stdin before anything else and the suite runs piped; and `git_working_diff` is
+monkeypatched rather than the checkout dirtied, so the tier-order checks don't depend on
+the state of the working tree.
+
 ## Architecture
 
 Everything is `focus.py`: CLI, storage, LLM client, HTTP server, and the dashboard HTML.
@@ -33,8 +42,9 @@ header declares `dependencies = []`, which is what makes `uv run --script` and t
 this): `tasks.json` (`{next_id, tasks[]}`), `config.json` (`{endpoint, model}`),
 `voice.json`, `memory.json` (`{facts[], disabled?}`), `memory/<key>.json` in the same shape
 for one repo's facts, `projects/<key>.json` per repo, `ui.json` (`{repo, recent[]}` — the
-dashboard's repo selection), and `pr/<name>.json` per review session. All writes go
-through `save_json`,
+dashboard's repo selection), `pr/<name>.json` per review session, `shortcut.json`
+(`{token, endpoint?, disabled?}`) and `shortcut/story-<id>.json` +
+`shortcut/repo-<key>.json` for tickets. All writes go through `save_json`,
 which writes `.tmp` then `os.replace` for atomicity. `load_json` swallows missing/corrupt
 files and returns the default — there is no migration layer, so any new task field must be
 read with `.get()` (`started` and `completed` already follow this rule).
@@ -54,7 +64,7 @@ and braces inside strings — small local models produce all three, so use it ra
 
 Every AI call site goes through `ask_model()` — chat + extract_json with one retry, and
 any garbage reply or HTTP failure surfaced as `ModelReplyError` (exit 2 in the CLI, 502
-in the UI; `NoModelError` stays 503). Don't call `chat()`/`extract_json()` directly from
+in the UI; `NoModelError` stays 503, and `TicketError` joins `ModelReplyError` at 2/502). Don't call `chat()`/`extract_json()` directly from
 a command: the traceback-on-flaky-model failure mode is exactly what `ask_model` exists
 to prevent. `raw=True` returns the reply text for non-JSON prompts (`draft`).
 
@@ -71,17 +81,20 @@ keys. Editing a prompt is a three-place change:
    cause.
 
 The mock dispatches on the prompt **up to the first suffix marker** (`MATCH THIS PERSON'S
-VOICE`, `PROJECT CONTEXT`, `USER MEMORY`), not the whole string. It has to: everything
-after a marker is arbitrary repo text, and this repo's own `CLAUDE.md` contains the
-literal string `"brain-dump"` — dispatching on the full prompt answers a PR request with
-a task list. If you add another suffix, add its marker to that split.
+VOICE`, `PROJECT CONTEXT`, `TICKET CONTEXT`, `USER MEMORY`), not the whole string. It has
+to: everything after a marker is arbitrary repo or ticket text, and this repo's own
+`CLAUDE.md` contains the literal string `"brain-dump"` — dispatching on the full prompt
+answers a PR request with a task list. If you add another suffix, add its marker to that
+split. `mock_llm.SEEN` records system prompts and `SEEN_USER` the user message, which is
+where the diff and the PR preamble ride.
 
-**`focus pr` takes verbs, not flags** — `pr` / `pr resume` / `pr check N`, matching `voice`
-and `project`. The pre-verb `--resume` / `--check N` / `--no-project` spellings still work
-but are `argparse.SUPPRESS`ed out of `--help`; `_pr_action()` normalises both forms in one
-place so `cmd_pr` doesn't branch on flags. `--project none` is the documented way to skip
-context for a review. Tests cover both spellings — don't delete the legacy ones without
-deleting their checks.
+**`focus pr` takes verbs, not flags** — `pr` / `pr fetch [N]` / `pr resume` / `pr check N`,
+matching `voice` and `project`. The pre-verb `--resume` / `--check N` / `--no-project`
+spellings still work but are `argparse.SUPPRESS`ed out of `--help`; `_pr_action()`
+normalises both forms in one place so `cmd_pr` doesn't branch on flags. The one `n`
+positional serves both `check N` and `fetch N`. `--project none` is the documented way to
+skip context for a review, `--story none` / `--no-ticket` the way to skip the ticket. Tests
+cover both spellings — don't delete the legacy ones without deleting their checks.
 
 **`pick_next` is deliberately AI-free.** Sorting by (status order, priority, remaining
 estimate, created) — with `--energy low` swapping priority and size — is the product
@@ -127,10 +140,70 @@ the diff's changed paths (or the user's text). `PINNED_HEADINGS` is coupled to t
 `/v1/embeddings` isn't reliably served, `detect_runtime()` has no notion of model *type*,
 and ranking ten sections of a 4kB document doesn't need vectors.
 
-Context is charged **against** `MAX_DIFF_CHARS`, not added to it (`cmd_pr` shrinks the diff
-budget by `len(ctx)`). An 8k-context model is already over budget on diff alone; anything
-that grows the request is a regression. `_clip()` exists so a heading-less doc or one
-oversized section can't blow the budget and silently eat the diff's share.
+Context is charged **against** `MAX_DIFF_CHARS`, not added to it (`run_pr_review` shrinks
+the diff budget by `len(ctx) + len(ticket) + len(preamble)`). An 8k-context model is
+already over budget on diff alone; anything that grows the request is a regression.
+`_clip()` exists so a heading-less doc or one oversized section can't blow the budget and
+silently eat the diff's share.
+
+**Shortcut tickets** — `ticket_system_suffix()` is a third suffix with the same contract as
+the voice and project ones (`""` when off or empty), under a `TICKET CONTEXT` marker. It
+goes into dump, break, draft **and** pr — unlike memory, which stays out of pr. The ticket
+is the one thing a diff genuinely cannot tell you, so it earns its share of that budget.
+
+`resolve_ticket_context()` **never fetches** unless `refresh=True`, which only
+`run_pr_review` passes; the `focus shortcut use/fetch` verbs call `fetch_story()` directly.
+Everything else reads `shortcut/story-<id>.json`. That is what keeps `focus dump` instant
+and working on a train — don't "improve" it by fetching on every command. Even with
+`refresh=True` a `TicketError` falls back to the cache rather than breaking the review.
+
+**The gate order in `resolve_ticket_context` is load-bearing.** `_any_cached_story()` (one
+`os.scandir`, early-exits on the first hit) runs *before* `load_shortcut_config()` and
+`load_ticket_repo()`, because the latter needs `project_key()` → two `git` shell-outs.
+Measured: a user who has never touched Shortcut pays **zero** subprocesses; putting the
+gate below those loads costs them two. Everything after the gate takes what it loaded as a
+parameter — `repo` into `detect_story_id`, `cfg` into `fetch_story` — so each file is read
+once per command, not two or three times.
+
+`detect_story_id()` is the tiered lookup, first hit wins, never raising: explicit id, then
+this repo's `branches[<current branch>]` pin, then `sc-12345` in the branch name (Shortcut's
+own convention), then the PR title/body, then recent commit subjects. `_SC_RE` requires the
+`sc-` prefix on purpose — a bare number in a commit message is not a story id. The last
+tier is a second `git` spawn for the weakest signal, so it is gated behind `deep=` — pr and
+the `shortcut` verbs pay for it, dump/break/draft don't.
+
+Two scopes with independent `disabled` flags, exactly like memory: `shortcut.json` (global,
+also holds the token) and `shortcut/repo-<key>.json` (this repo's pins). The token is read
+from `SHORTCUT_API_TOKEN` first so it can be scoped to one shell. `shortcut.json` is the
+only file in `~/.focus/` holding a credential, and the only caller of `save_json(...,
+mode=0o600)` — the chmod lands on the temp file *before* `os.replace`, since replace
+preserves the source's mode. `focus shortcut token` reads from stdin, never argv, so a
+token never enters shell history or `ps`.
+
+**`focus pr` can pull its own diff.** `get_diff()` tiers are `-f` → stdin → working tree →
+the branch's PR. The PR sits **below** the working tree deliberately: uncommitted changes
+are what you're in the middle of, and silently reviewing something else is worse than not
+auto-detecting at all. A clean tree is the "I pushed, now review it" moment.
+
+`focus pr fetch [N]` does *not* go through `get_diff` — it calls `gh_pr_diff()` directly,
+exactly as the UI does, because forcing the PR means skipping every tier including `args`.
+That is also why it can surface `_gh`'s reason as a `SystemExit` while the fallback tier
+folds it into the "no diff found" message.
+
+GitHub is reached only by shelling out to the user's own `gh` — focus stores no GitHub
+token and speaks no GitHub API. `_gh()` is `_git()`'s sibling but returns `(stdout, reason)`
+rather than collapsing failures to `""`: an explicit `focus pr fetch` has to be able to say
+*why* nothing happened. Two timeouts, not one: `GH_TIMEOUT` (30s) for the asked-for fetch,
+`GH_FALLBACK_TIMEOUT` (10s) for the implicit tier, which fires when the user typed nothing
+but `focus pr` and must not sit there for a minute × two `gh` invocations. When a PR is
+found its title and body ride ahead of the diff in the user message (`_pr_preamble`) —
+cheap, high-signal context the author already wrote.
+
+**The dashboard has no implicit PR tier.** `/api/pr` `review` is paste → working tree →
+400; pulling a PR is the separate `fetch` action behind its own button. `gh` is two
+subprocesses on a server thread, and the reason CLAUDE.md already forbids `get_diff()` in
+the UI is thread-blocking — a silent 20-second version of it from a button labelled
+"Review changes in <repo>" would be the same mistake.
 
 **Which repo is "here" is `active_root()`.** `_root_and_key()` resolves against it, so
 `project_root()`, `project_key()`, `resolve_project_context()` and everything downstream
@@ -163,10 +236,15 @@ server stays up. `do_POST` rejects requests whose `Host`/`Origin` isn't local
 don't remove the check when adding endpoints.
 
 Feature areas each get one multiplexed POST route dispatching on an `action` field
-(`/api/pr`, `/api/triage`, `/api/memory`, `/api/voice`, `/api/project`, `/api/repo`),
-mirroring the CLI's verbs; panel bodies lazy-load via `action: "show"` on open, and nothing
-heavy (pr sessions, profile text, `repo_brief`, the repo picker's directory listing) is ever
-added to the 5-second `/api/state` poll.
+(`/api/pr`, `/api/triage`, `/api/memory`, `/api/voice`, `/api/project`, `/api/repo`,
+`/api/shortcut`), mirroring the CLI's verbs; panel bodies lazy-load via `action: "show"` on
+open, and nothing heavy (pr sessions, profile text, `repo_brief`, the repo picker's
+directory listing, `shortcut_state()`) is ever added to the 5-second `/api/state` poll.
+The ticket badge in particular stays off the poll: resolving one needs the current branch,
+which changes without the repo root changing and so can't ride `_ROOT_CACHE`.
+
+`/api/shortcut` accepts an API token, which is the strongest reason `_origin_ok` covers
+every POST — and `shortcut_state()` reports `has_token` but never returns the token itself.
 
 `/api/repo` (`show` / `browse` / `use`) is the picker, and the only writer of `_ACTIVE_ROOT`.
 It is a POST route so `_origin_ok` covers it — a filesystem listing must not be reachable by
@@ -174,14 +252,36 @@ a cross-origin form post. `browse` is a `os.listdir` plus one `.git` stat per en
 shell-out. After `use`, the page reloads the project and memory panels if they're open;
 both describe the repo and go stale otherwise.
 The UI must never call `get_diff()` — its stdin tier blocks a server thread forever;
-`git_working_diff()` is the UI-safe extraction, just as `run_pr_review()` /
-`_latest_session_path()` are the print-free, SystemExit-free cores shared with `cmd_pr`.
+`git_working_diff()` and `gh_pr_diff()` are the UI-safe extractions, just as
+`run_pr_review()`, `pin_story()`, `set_ticket_enabled()`, `clear_story_cache()` and
+`_latest_session_path()` are the print-free, SystemExit-free cores shared with the `cmd_*`
+functions. When a UI branch and its CLI verb would otherwise write the same state two ways,
+add the core rather than the second copy — the duplication CLAUDE.md sanctions is command
+*flow*, not bookkeeping.
 
 ## Constraints
 
-Network calls only ever go to `127.0.0.1`, and the UI binds `127.0.0.1`. The whole premise
-is that diffs, drafts, voice samples and harvested repo context never leave the machine —
-don't add a remote endpoint, telemetry, or a third-party dependency. `repo_brief()` only
-shells out to offline git subcommands (`rev-parse`, `config --get`, `ls-files`, `log`).
-Note `tomllib` is 3.11+ and the PEP 723 header says `>=3.9`, so manifests are read as text,
-never parsed with it.
+**Nothing you write ever leaves the machine.** Diffs, drafts, voice samples, memory facts
+and harvested repo context go to the local model and nowhere else, the UI binds
+`127.0.0.1`, and there is no telemetry and no third-party dependency. That is the premise,
+and it is the thing to protect.
+
+Two features read from elsewhere, and the rule is precise: **outbound reads only, to
+exactly two places.**
+
+1. `gh` (a binary the user already installed and authenticated) for the current branch's
+   PR. focus stores no GitHub credential and constructs no GitHub URL — everything goes
+   through `_gh()`.
+2. `api.app.shortcut.com` for the ticket you're on, via `http_json` with a
+   `Shortcut-Token` header, from `fetch_story()` only.
+
+Both are `GET`-shaped: focus never posts, comments, updates or deletes anything on either
+service. Nothing from `~/.focus/` — no diff, no draft, no memory fact — is ever included in
+an outbound request; the Shortcut request carries a story id and the token, and that is all.
+A new remote host, a write to a remote service, or any outbound call carrying user content
+is a change to the product's promise, not a feature — it needs the README's Privacy section
+rewritten alongside it.
+
+`repo_brief()` still only shells out to offline git subcommands (`rev-parse`,
+`config --get`, `ls-files`, `log`). Note `tomllib` is 3.11+ and the PEP 723 header says
+`>=3.9`, so manifests are read as text, never parsed with it.

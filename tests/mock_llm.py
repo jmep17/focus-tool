@@ -6,14 +6,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # Every system prompt this mock has been sent, newest last. The mock runs in-process, so
 # tests read it directly to assert what reached the model without decoding canned replies.
 SEEN = []
+# ...and the user message alongside it, for the things that ride there rather than in the
+# system prompt (the diff, and the PR description put in front of it).
+SEEN_USER = []
 
 def canned_reply(messages):
     full = messages[0]["content"]
     # Dispatch on the BASE prompt only. Everything after a suffix marker is arbitrary
-    # user/repo text — this repo's own CLAUDE.md documents the string "brain-dump", so
-    # dispatching on the whole thing answers a PR request with a task list.
+    # user/repo/ticket text — this repo's own CLAUDE.md documents the string "brain-dump",
+    # so dispatching on the whole thing answers a PR request with a task list.
     system = (full.split("\nMATCH THIS PERSON'S VOICE")[0]
               .split("\nPROJECT CONTEXT")[0]
+              .split("\nTICKET CONTEXT")[0]
               .split("\nUSER MEMORY")[0])
     if "compact project profile" in system:
         return json.dumps({"profile":
@@ -73,6 +77,7 @@ class MockHandler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", 0))
         payload = json.loads(self.rfile.read(n).decode())
         SEEN.append(payload["messages"][0]["content"])
+        SEEN_USER.append(payload["messages"][-1]["content"])
         content = canned_reply(payload["messages"])
         body = json.dumps({"choices": [{"message": {"role": "assistant",
                                                     "content": content}}]}).encode()

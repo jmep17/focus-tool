@@ -121,7 +121,10 @@ notification too.
 ### "I lose my place reviewing PRs every time I'm interrupted" → `focus pr`
 
 ```bash
-gh pr diff 4521 | focus pr --name pr-4521    # or: git diff HEAD | focus pr
+focus pr                 # your staged/unstaged changes — or, if the tree is
+                         # clean, this branch's own PR, pulled for you
+focus pr fetch           # always this branch's PR
+focus pr fetch 4600      # ...or that one
 focus pr resume          # after ANY interruption: shows "<- you are here"
 focus pr check 3         # tick item 3 as reviewed
 ```
@@ -129,6 +132,16 @@ focus pr check 3         # tick item 3 as reviewed
 The model writes a 3-sentence summary, flags where to look hardest, and builds
 a file-by-file checklist. Your position is saved on disk, so a meeting or a
 Slack ping can't wipe your mental state — the checklist *is* the state.
+
+You don't have to find the diff yourself. With nothing staged, `focus pr` asks
+your own `gh` for the pull request on the branch you're standing on, names the
+session after it (`pr-4521`), and puts the PR's title and description in front of
+the diff. Uncommitted changes still win — what you're in the middle of is what
+you meant. `-f file.diff` and piping still work exactly as before, and if `gh`
+isn't installed or the branch has no PR, focus says which.
+
+Nothing is stored on your behalf: focus never sees a GitHub token, it just runs
+the CLI you already logged into, and only ever reads.
 
 ### "I stare at empty message boxes" → `focus draft`
 
@@ -239,12 +252,52 @@ available on a local server, an index goes stale, and ranking ten sections of a
 is never coming from somewhere you can't see:
 
 ```
-PR REVIEW: pr-4521  (from stdin)
+PR REVIEW: pr-4521  (from PR #4521)
+  #4521 Retry payments on transient errors
+  https://github.com/you/repo/pull/4521
   project context: github.com_you_repo (2143 chars)
+  ticket: sc-12345 Retry payments on transient errors (via branch name, 986 chars)
 ```
 
 Everything harvested — your docs, your file tree, your commit history — stays on
 the machine, same as diffs and drafts.
+
+### "The AI doesn't know what I was asked to build" → `focus shortcut`
+
+```bash
+focus shortcut token          # paste your Shortcut API token (stdin, not argv)
+focus shortcut use 12345      # pin that story to the branch you're on
+focus shortcut                # what the AI is being told, and how it found it
+focus shortcut fetch          # refresh it
+focus shortcut ls             # what's cached
+focus shortcut off [--here]   # stop injecting, everywhere or just this repo
+focus pr --no-ticket          # skip it for one command (dump/break/draft too)
+```
+
+Your repo profile tells the model how the code works. Your memory tells it how
+*you* work. Neither tells it **what you were asked to do** — so a review can only
+ask "is this code correct", never "does this actually do what the ticket said".
+
+Point focus at a Shortcut story and the answer changes. The story's description,
+its acceptance criteria and its task list go into `focus pr` — which now flags the
+criterion your diff quietly doesn't meet — and into `dump`, `break` and `draft`,
+so a breakdown is the acceptance criteria rather than your best guess at them.
+
+**Usually you don't tell it anything.** focus finds the story itself, first hit
+wins: a story you pinned to this branch, then `sc-12345` in the branch name
+(Shortcut's own convention, so this is free if you use its branch button), then
+the PR title or description, then your recent commit messages.
+
+**It reads the cache, not the network.** `focus dump` never makes a request — it
+uses `~/.focus/shortcut/story-<id>.json`, so it stays instant and works on a
+train. Only `focus pr` and the explicit `use`/`fetch` verbs refresh, and if
+Shortcut is unreachable they fall back to the cached copy rather than failing.
+
+Your token lives in `~/.focus/shortcut.json`, mode 600, and is sent to Shortcut
+and nowhere else — never to the model, never into a session file. `SHORTCUT_API_TOKEN`
+works too if you'd rather not put it on disk. `focus shortcut clear` forgets the
+lot. The request going out contains a story id and your token; nothing from your
+machine rides along.
 
 ### "I want to see it" → `focus ui`
 
@@ -262,7 +315,8 @@ rejects requests from other origins, so a random webpage can't poke your tasks.
 **change** opens a folder picker — browse, paste a path, or click one you've used
 before, with git repos flagged. Everything repo-shaped follows the choice: which
 diff **Review changes in …** picks up, which project profile is appended to every
-prompt, and which project memory the Memory panel edits. The choice is remembered,
+prompt, which ticket the **Ticket** panel resolves, and which project memory the
+Memory panel edits. The choice is remembered,
 so the dashboard reopens where you left it — the CLI is unaffected and stays
 wherever you're `cd`'d to. Browsing never leaves the machine; it's the same local
 server that was already reading your repo.
@@ -284,18 +338,23 @@ focus move 4 later   # inbox / now / next / later
 ## Suggested daily shape
 
 1. Morning: `focus dump` the noise, `focus next`, `focus timer`.
-2. Before a PR: `focus pr`, read the summary, work the checklist.
-3. After every interruption: `focus pr resume` or `focus next` — the tool
+2. Starting a ticket: `focus shortcut use 12345`, then `focus break` it.
+3. Before a PR: `focus pr`, read the summary, work the checklist.
+4. After every interruption: `focus pr resume` or `focus next` — the tool
    remembers so you don't have to. Leaving your desk? `focus note` first.
-4. Any message that's been sitting unsent for 10+ minutes: `focus draft`.
-5. End of day: `focus today` — look at what you actually did.
-6. Once a week or so: `focus triage`.
+5. Any message that's been sitting unsent for 10+ minutes: `focus draft`.
+6. End of day: `focus today` — look at what you actually did.
+7. Once a week or so: `focus triage`.
 
 ## Testing / hacking
 
 ```bash
-python3 tests/test_focus.py   # 173 end-to-end checks against a mock model
+python3 tests/test_focus.py   # 233 end-to-end checks against local fakes
 ```
+
+No network, no real model, no GitHub and no Shortcut account: `tests/mock_llm.py`
+and `tests/mock_shortcut.py` are loopback servers, and `tests/fake_gh.py` stands in
+for the `gh` binary on `PATH`.
 
 Single file, MIT-style — change anything. Prompts live near the top of `focus.py`
 (`SYS_DUMP`, `SYS_BREAK`, `SYS_PR`, `SYS_DRAFT`, `SYS_VOICE`, `SYS_PROJECT`) — tune
@@ -303,13 +362,30 @@ them to your taste; that's half the fun.
 
 ## Privacy
 
-- Talks only to `127.0.0.1` (your model server). The UI binds to `127.0.0.1`
-  and refuses cross-origin requests. Timer notifications use local `osascript`.
+**Nothing you write ever leaves the machine.** Diffs, drafts, notes, memory facts,
+voice samples, and everything `focus project` harvests from your repo (docs,
+manifests, file tree, commit history) go to your local model server on
+`127.0.0.1` and nowhere else. On a work machine, that's the whole point.
+
+Two features *read* from elsewhere, and it's worth being exact about them:
+
+- **`focus pr`** runs your own `gh` CLI to fetch the branch's pull request. focus
+  never sees a GitHub token — it shells out to the tool you already logged into,
+  and only reads. Skip it entirely by piping a diff or using `-f`.
+- **`focus shortcut`** fetches the story you're working on from
+  `api.app.shortcut.com`. The request carries a story id and your token; nothing
+  from your machine goes with it. The token lives in `~/.focus/shortcut.json` at
+  mode 600, is sent to Shortcut only, and is never given to the model. Don't
+  configure a token and this never runs.
+
+Neither ever writes: focus does not comment, update, close or push anything. And
+neither is on the path of the everyday commands — `dump`, `break` and `draft` read
+a local cache, so they work with the network off.
+
+- The UI binds to `127.0.0.1` and refuses cross-origin requests. Timer
+  notifications use local `osascript`.
 - Data: plain JSON under `~/.focus/` — tasks, the `history.jsonl` event log,
-  memory facts (global and per-repo), voice and project profiles, and which repo
-  the dashboard was last pointed at. Delete the folder, it's gone.
+  memory facts (global and per-repo), voice and project profiles, cached tickets,
+  and which repo the dashboard was last pointed at. Delete the folder, it's gone.
 - The dashboard's folder picker lists directories on your machine to a page served
   from `127.0.0.1`, and nowhere else. Nothing is uploaded, indexed or phoned home.
-- Diffs, drafts, memory facts, and anything `focus project` harvests from your
-  repo (docs, manifests, file tree, commit history) are sent to your local model
-  only. On a work machine, that's the whole point.
