@@ -403,6 +403,125 @@ doomed = json.loads(body)["id"]
 status, body = api("/api/update", {"id": doomed, "delete": True})
 check("ui drop deletes the task", json.loads(body).get("deleted") == doomed)
 check("dropped task is gone", focus.get_task(focus.load_store(), doomed) is None)
+
+def api_status(path, payload):
+    """Status code even for error responses (api() raises on non-2xx)."""
+    try:
+        return api(path, payload)[0]
+    except urllib.error.HTTPError as e:
+        return e.code
+
+# --- UI: state extensions (doctor detail, energy, week, calibration)
+state = json.loads(api("/api/state")[1])
+check("state exposes model detail", state["model"]["model"] == "mock-model-8b", state)
+check("state has low-energy pick", "next_low_id" in state)
+check("state carries stale_days", state["stale_days"] == focus.STALE_DAYS)
+check("state carries week + calib fields",
+      state["done_week"] and "est" in state["done_today"][0], state.get("done_week"))
+check("state names home and root", state["home"] == TMP and state["root"])
+status, body = api("/")
+check("ui html carries new panels",
+      "PR review" in body and "Triage" in body and "prPanel" in body)
+
+# --- UI: add with estimate/notes, break with hint, draft polish/to
+status, body = api("/api/add", {"title": "Estimated via UI",
+                                "estimate_min": 15, "notes": "check the docs"})
+t_add = json.loads(body)
+check("ui add carries estimate+notes",
+      t_add["estimate_min"] == 15 and t_add["notes"] == "check the docs", t_add)
+status, body = api("/api/break", {"id": t_add["id"], "hint": "focus on tests"})
+check("ui break with hint", len(json.loads(body)["subtasks"]) == 3)
+status, body = api("/api/draft", {"text": "cover tuesday", "polish": True,
+                                  "to": "Priya", "no_voice": True})
+check("ui draft polish+to", status == 200 and json.loads(body)["message"])
+
+# --- UI: triage decisions (stale_t was backdated above and is still untouched)
+status, body = api("/api/triage", {"id": stale_t["id"], "decision": "keep"})
+check("ui triage keep freshens", json.loads(body)["updated"][:10] != "2026-01-01")
+check("ui triage keep logged",
+      any(e["event"] == "triage" and e.get("decision") == "keep"
+          and e.get("id") == stale_t["id"] for e in focus.load_history()))
+store = focus.load_store()
+focus.get_task(store, stale_t["id"])["updated"] = "2026-01-01T00:00:00+00:00"
+focus.save_store(store)
+status, body = api("/api/triage", {"id": stale_t["id"], "decision": "later"})
+check("ui triage later moves", json.loads(body)["status"] == "later")
+td = json.loads(api("/api/add", {"title": "Triage done target"})[1])["id"]
+status, body = api("/api/triage", {"id": td, "decision": "done"})
+check("ui triage done completes", json.loads(body).get("completed"))
+tdr = json.loads(api("/api/add", {"title": "Triage drop target"})[1])["id"]
+status, body = api("/api/triage", {"id": tdr, "decision": "drop"})
+check("ui triage drop deletes", json.loads(body)["deleted"] == tdr
+      and focus.get_task(focus.load_store(), tdr) is None)
+check("ui triage rejects bad decision",
+      api_status("/api/triage", {"id": stale_t["id"], "decision": "zap"}) == 400)
+
+# --- UI: memory show/add (memory was left disabled by the CLI checks above)
+m = json.loads(api("/api/memory", {"action": "show"})[1])
+check("ui memory show reports disabled",
+      m["disabled"] is True and any("tiny first steps" in f for f in m["facts"]), m)
+m = json.loads(api("/api/memory", {"action": "add", "text": "works best before noon"})[1])
+check("ui memory add re-enables",
+      m["disabled"] is False and "works best before noon" in m["facts"], m)
+
+# --- UI: pr review (memory is ON right now — it must still stay out of pr prompts)
+status, body = api("/api/pr", {"action": "review", "diff": diff, "name": "ui-pr"})
+s_pr = json.loads(body)
+check("ui pr review summarises",
+      "retry logic" in s_pr["summary"] and len(s_pr["checklist"]) == 2, s_pr)
+check("ui pr session saved", os.path.exists(focus.pr_session_path("ui-pr")))
+check("pr never carries user memory", "USER MEMORY" not in mock_llm.SEEN[-1])
+status, body = api("/api/pr", {"action": "check", "n": 1, "name": "ui-pr"})
+check("ui pr check ticks", json.loads(body)["checklist"][0]["done"] is True)
+check("ui pr check out of range rejected",
+      api_status("/api/pr", {"action": "check", "n": 99, "name": "ui-pr"}) == 400)
+status, body = api("/api/pr", {"action": "resume"})
+check("ui pr resume finds latest", json.loads(body)["name"] == "ui-pr")
+check("git_working_diff returns a pair",
+      isinstance(focus.git_working_diff(), tuple) and len(focus.git_working_diff()) == 2)
+
+# --- UI: memory edit/off (back to disabled, the state the tail of the suite expects)
+m = json.loads(api("/api/memory", {"action": "edit", "text": "fact one\n\nfact two\n"})[1])
+check("ui memory edit replaces facts", m["facts"] == ["fact one", "fact two"], m)
+m = json.loads(api("/api/memory", {"action": "off"})[1])
+check("ui memory off keeps facts", m["disabled"] is True and len(m["facts"]) == 2)
+
+# --- UI: voice show/setup/learn/edit/off (off is destructive — keep it last)
+v = json.loads(api("/api/voice", {"action": "show"})[1])
+check("ui voice show", v["profile"].startswith("Open Slack")
+      and len(v["questions"]) == 8, v)
+v = json.loads(api("/api/voice", {"action": "learn",
+                                  "sample": "hey — shipping the fix today. Cheers, J"})[1])
+check("ui voice learn grows samples", v["samples_count"] == 3, v)
+v = json.loads(api("/api/voice", {"action": "setup",
+                                  "answers": {"greeting": "hey"}, "samples": []})[1])
+check("ui voice setup from answers", v["profile"].startswith("Open Slack"), v)
+api("/api/voice", {"action": "edit", "profile": "Always sign off with Cheers, J."})
+check("ui voice edit replaces",
+      focus.load_voice()["profile"] == "Always sign off with Cheers, J.")
+check("ui voice setup rejects empty",
+      api_status("/api/voice", {"action": "setup", "answers": {}, "samples": []}) == 400)
+api("/api/voice", {"action": "off"})
+check("ui voice off clears everything", focus.load_voice() == {})
+
+# --- UI: project show/setup/ls/edit/off (ends with no saved profile, as before)
+p = json.loads(api("/api/project", {"action": "show"})[1])
+check("ui project show falls back to repo docs",
+      p.get("fallback") is True and p["source"] == "CLAUDE.md", p)
+p = json.loads(api("/api/project", {"action": "setup"})[1])
+check("ui project setup distils",
+      p["source"] == "harvest" and "save_json" in p["profile"], p)
+check("ui project setup persisted",
+      focus.load_project(focus.project_key()).get("source") == "harvest")
+status, body = api("/api/project", {"action": "ls"})
+check("ui project ls marks here", any(x["current"] for x in json.loads(body)["projects"]))
+api("/api/project", {"action": "edit", "profile": "## Stack\nedited"})
+check("ui project edit saves",
+      focus.load_project(focus.project_key()).get("source") == "edit")
+p = json.loads(api("/api/project", {"action": "off"})[1])
+check("ui project off clears",
+      focus.load_project(focus.project_key()) == {} and p.get("fallback") is True, p)
+
 req = urllib.request.Request(
     f"http://127.0.0.1:{ui_port}/api/add",
     data=json.dumps({"title": "evil"}).encode(),
@@ -413,6 +532,16 @@ try:
 except urllib.error.HTTPError as e:
     forged = e.code
 check("cross-origin POST rejected", forged == 403, forged)
+req = urllib.request.Request(
+    f"http://127.0.0.1:{ui_port}/api/voice",
+    data=json.dumps({"action": "off"}).encode(),
+    headers={"Content-Type": "application/json", "Origin": "http://evil.example"})
+try:
+    urllib.request.urlopen(req, timeout=10)
+    forged = 200
+except urllib.error.HTTPError as e:
+    forged = e.code
+check("cross-origin POST to voice rejected", forged == 403, forged)
 
 # --- graceful no-model fallback: point config at a dead port
 with open(os.path.join(TMP, "config.json"), "w") as f:

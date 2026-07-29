@@ -1177,13 +1177,9 @@ def cmd_memory(args):
 # model is already over budget at 60k chars of diff; context must not make that worse.
 MAX_DIFF_CHARS = 60_000
 
-def get_diff(args):
-    if args.file:
-        with open(args.file, encoding="utf-8", errors="replace") as f:
-            return f.read(), os.path.basename(args.file)
-    if not sys.stdin.isatty():
-        return sys.stdin.read(), "stdin"
-    # fall back to git
+def git_working_diff():
+    """(diff, source) from staged then unstaged changes, or (None, None). The UI calls
+    this directly — get_diff's stdin tier would block a server thread forever."""
     for cmd in (["git", "diff", "--staged"], ["git", "diff", "HEAD"]):
         try:
             out = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
@@ -1191,6 +1187,17 @@ def get_diff(args):
                 return out.stdout, " ".join(cmd)
         except (OSError, subprocess.TimeoutExpired):
             pass
+    return None, None
+
+def get_diff(args):
+    if args.file:
+        with open(args.file, encoding="utf-8", errors="replace") as f:
+            return f.read(), os.path.basename(args.file)
+    if not sys.stdin.isatty():
+        return sys.stdin.read(), "stdin"
+    diff, source = git_working_diff()
+    if diff:
+        return diff, source
     raise SystemExit(
         "No diff found. Pipe one in (`gh pr diff 123 | focus pr`), use -f file.diff,\n"
         "or run inside a repo with staged/unstaged changes."
@@ -1209,23 +1216,19 @@ def _pr_action(args):
         return "resume", None
     return "review", None
 
-def cmd_pr(args):
-    action, item = _pr_action(args)
-    if action != "review":
-        if action == "check" and item is None:
-            raise SystemExit("Which item? `focus pr check 3`")
-        return cmd_pr_resume(args, item)
-    diff, source = get_diff(args)
+def run_pr_review(diff, source, name=None, project=None, no_project=False):
+    """Resolve context, charge it against the diff budget, ask the model, save the
+    session. Shared by cmd_pr and the UI's /api/pr — never prints, never SystemExits."""
     # Resolve context first, then charge it to the diff's budget so the request never
     # grows. Keyed on the paths the diff touches, so only relevant sections survive.
     ctx, ctx_source = resolve_project_context(
-        diff_paths(diff), MAX_CONTEXT_CHARS, args.project, args.no_project)
+        diff_paths(diff), MAX_CONTEXT_CHARS, project, no_project)
     truncated = False
     if len(diff) > MAX_DIFF_CHARS - len(ctx):
         diff = diff[:MAX_DIFF_CHARS - len(ctx)]
         truncated = True
     data = ask_model(SYS_PR + project_block(ctx), diff)
-    name = args.name or datetime.now().strftime("pr-%Y%m%d-%H%M")
+    name = name or datetime.now().strftime("pr-%Y%m%d-%H%M")
     session = {
         "name": name,
         "source": source,
@@ -1240,18 +1243,36 @@ def cmd_pr(args):
         ],
     }
     save_json(pr_session_path(name), session)
+    return session
+
+def cmd_pr(args):
+    action, item = _pr_action(args)
+    if action != "review":
+        if action == "check" and item is None:
+            raise SystemExit("Which item? `focus pr check 3`")
+        return cmd_pr_resume(args, item)
+    diff, source = get_diff(args)
+    session = run_pr_review(diff, source, args.name, args.project, args.no_project)
     print_pr(session)
-    print(f"Saved as '{name}'. After any interruption: focus pr resume")
+    print(f"Saved as '{session['name']}'. After any interruption: focus pr resume")
+
+def _latest_session_path():
+    """Newest session file in pr/, or None (dir missing or empty)."""
+    d = os.path.join(focus_home(), "pr")
+    try:
+        files = sorted(
+            (os.path.join(d, f) for f in os.listdir(d) if f.endswith(".json")),
+            key=os.path.getmtime, reverse=True,
+        )
+    except OSError:
+        return None
+    return files[0] if files else None
 
 def latest_session():
-    d = os.path.join(focus_home(), "pr")
-    files = sorted(
-        (os.path.join(d, f) for f in os.listdir(d) if f.endswith(".json")),
-        key=os.path.getmtime, reverse=True,
-    )
-    if not files:
+    path = _latest_session_path()
+    if not path:
         raise SystemExit("No PR sessions yet. Run `focus pr` on a diff first.")
-    return files[0]
+    return path
 
 def print_pr(s):
     print(f"\nPR REVIEW: {s['name']}  (from {s['source']})")
@@ -1336,7 +1357,7 @@ def _derive_profile(answers, samples):
     data = ask_model(SYS_VOICE, "\n".join(parts))
     profile = data.get("profile", "").strip()
     if not profile:
-        raise SystemExit("Model returned an empty profile — try again.")
+        raise ModelReplyError("Model returned an empty profile — try again.")
     return profile
 
 def cmd_voice(args):
@@ -1437,11 +1458,10 @@ def _derive_project(root):
     try:
         data = ask_model(SYS_PROJECT, brief)
     except NoModelError:
-        print("(no local model — saving the raw repo brief instead of a distilled one)\n")
         return _clip(brief, MAX_CONTEXT_CHARS * 2), "brief"
     profile = data.get("profile", "").strip()
     if not profile:
-        raise SystemExit("Model returned an empty profile — try again.")
+        raise ModelReplyError("Model returned an empty profile — try again.")
     return profile, "harvest"
 
 def cmd_project(args):
@@ -1505,6 +1525,8 @@ def cmd_project(args):
     root = project_root()
     print(f"Reading {root} ...")
     profile, source = _derive_project(root)
+    if source == "brief":
+        print("(no local model — saving the raw repo brief instead of a distilled one)\n")
     save_project(key, {"profile": profile, "root": root,
                        "source": source, "updated": now_iso()})
     print(f"\nPROJECT PROFILE: {key}\n")
@@ -1532,21 +1554,38 @@ def cmd_doctor(args):
 def api_state():
     store = load_store()
     nxt = pick_next(store)
+    nxt_low = pick_next(store, energy="low")
     llm_ok = True
     try:
-        detect_runtime()
-    except NoModelError:
+        name, base, model_id = detect_runtime()
+        model = {"runtime": name, "endpoint": base, "model": model_id}
+    except NoModelError as e:
         llm_ok = False
+        model = {"error": str(e)}
     ctx, ctx_source = resolve_project_context(budget=BRIEF_CONTEXT_CHARS)
-    today = datetime.now(timezone.utc).date().isoformat()
-    done_today = [{"id": t["id"], "title": t["title"]}
-                  for t in store["tasks"] if t["status"] == "done"
-                  and (t.get("completed") or "")[:10] == today]
+    today = datetime.now(timezone.utc).date()
+    week_ago = (today - timedelta(days=7)).isoformat()
+
+    def _done_entry(t):
+        return {"id": t["id"], "title": t["title"], "completed": t.get("completed"),
+                "est": total_estimate(t), "actual": actual_minutes(t)}
+
+    done_week = sorted(
+        (_done_entry(t) for t in store["tasks"] if t["status"] == "done"
+         and (t.get("completed") or "")[:10] >= week_ago),
+        key=lambda d: d["completed"] or "")
+    done_today = [d for d in done_week
+                  if (d["completed"] or "")[:10] == today.isoformat()]
+    hist = load_history()
     return {"tasks": store["tasks"], "next_id": nxt["id"] if nxt else None,
-            "llm": llm_ok, "voice": bool(load_voice().get("profile")),
+            "next_low_id": nxt_low["id"] if nxt_low else None,
+            "llm": llm_ok, "model": model,
+            "voice": bool(load_voice().get("profile")),
             "project": ctx_source if ctx else "",
             "memory": bool(memory_system_suffix()),
-            "done_today": done_today, "streak": _streak(_done_dates(load_history()))}
+            "done_today": done_today, "done_week": done_week,
+            "streak": _streak(_done_dates(hist)), "ratio": _estimate_ratio(hist),
+            "stale_days": STALE_DAYS, "home": focus_home(), "root": project_root()}
 
 class UIHandler(BaseHTTPRequestHandler):
     def log_message(self, *a):
@@ -1594,9 +1633,12 @@ class UIHandler(BaseHTTPRequestHandler):
             body = self._body()
             if self.path == "/api/add":
                 store = load_store()
+                est = body.get("estimate_min")
                 t = new_task(store, body["title"],
                              status=body.get("status", "inbox"),
-                             priority=int(body.get("priority", 2)))
+                             priority=int(body.get("priority", 2)),
+                             estimate_min=int(est) if est else None,
+                             notes=body.get("notes", ""))
                 save_store(store)
                 self._send(200, t)
             elif self.path == "/api/update":
@@ -1634,11 +1676,14 @@ class UIHandler(BaseHTTPRequestHandler):
                 t = get_task(store, int(body["id"]))
                 if not t:
                     return self._send(404, {"error": "no such task"})
+                context = t["title"] + ("\nNotes: " + t["notes"] if t["notes"] else "")
+                if body.get("hint"):
+                    context += "\nExtra context: " + str(body["hint"])
                 system = SYS_BREAK + project_system_suffix(
-                    t["title"], BRIEF_CONTEXT_CHARS,
+                    context, BRIEF_CONTEXT_CHARS,
                     disabled=body.get("no_project", False)) \
                     + memory_system_suffix(body.get("no_memory", False))
-                data = ask_model(system, t["title"])
+                data = ask_model(system, context)
                 t["subtasks"] = [
                     {"text": s["text"], "done": False,
                      "estimate_min": s.get("estimate_min")}
@@ -1673,14 +1718,18 @@ class UIHandler(BaseHTTPRequestHandler):
                 tone = body.get("tone", "friendly")
                 tone_line = {"friendly": "Tone: warm and friendly.",
                              "neutral": "Tone: neutral and professional.",
-                             "firm": "Tone: polite but firm."}.get(tone, "")
-                system = "\n".join([SYS_DRAFT, style, tone_line]) + \
+                             "firm": "Tone: polite but firm; do not soften the ask "
+                                     "away."}.get(tone, "")
+                to = f"Recipient: {body['to']}." if body.get("to") else ""
+                system = "\n".join([SYS_DRAFT, style, tone_line, to]) + \
                     voice_system_suffix(body.get("no_voice", False)) + \
                     project_system_suffix(body["text"], BRIEF_CONTEXT_CHARS,
                                           disabled=body.get("no_project", False)) + \
                     memory_system_suffix(body.get("no_memory", False))
-                msg = ask_model(system,
-                                "Write the message from these notes:\n\n" + body["text"],
+                prefix = ("Polish this draft, keep my meaning and roughly my voice:\n\n"
+                          if body.get("polish")
+                          else "Write the message from these notes:\n\n")
+                msg = ask_model(system, prefix + body["text"],
                                 temperature=0.5, raw=True)
                 self._send(200, {"message": msg.strip()})
             elif self.path == "/api/note":
@@ -1695,15 +1744,182 @@ class UIHandler(BaseHTTPRequestHandler):
                 self._send(200, t)
             elif self.path == "/api/timer":
                 ev = body.get("event")
+                task_id = None
                 if ev in ("timer_start", "timer_done", "timer_cancel"):
-                    log_event(ev, minutes=int(body.get("minutes", 25)), source="ui")
-                self._send(200, {"ok": True})
+                    now_tasks = [t for t in load_store()["tasks"]
+                                 if t["status"] == "now"]
+                    task_id = now_tasks[0]["id"] if now_tasks else None
+                    log_event(ev, minutes=int(body.get("minutes", 25)),
+                              task_id=task_id, source="ui")
+                self._send(200, {"ok": True, "task_id": task_id})
+            elif self.path == "/api/triage":
+                store = load_store()
+                t = get_task(store, int(body["id"]))
+                if not t:
+                    return self._send(404, {"error": "no such task"})
+                decision = body.get("decision")
+                if decision not in ("keep", "later", "done", "drop"):
+                    return self._send(400, {"error": "bad decision"})
+                if decision == "drop":
+                    store["tasks"] = [x for x in store["tasks"] if x["id"] != t["id"]]
+                elif decision == "done":
+                    complete_task(t)
+                elif decision == "later":
+                    t["status"] = "later"
+                    touch(t)
+                else:  # keep: freshen so it stops nagging for another fortnight
+                    touch(t)
+                save_store(store)
+                log_event("triage", id=t["id"], decision=decision)
+                self._send(200, {"deleted": t["id"]} if decision == "drop" else t)
+            elif self.path == "/api/memory":
+                m = load_memory()
+                action = body.get("action", "show")
+                if action == "add":
+                    text = (body.get("text") or "").strip()
+                    if not text:
+                        return self._send(400, {"error": "Nothing to remember."})
+                    m.setdefault("facts", []).append({"text": text, "ts": now_iso()})
+                    m.pop("disabled", None)
+                    m["updated"] = now_iso()
+                    save_memory(m)
+                elif action == "edit":
+                    lines = [ln.strip() for ln in (body.get("text") or "").splitlines()
+                             if ln.strip()]
+                    m["facts"] = [{"text": ln, "ts": now_iso()} for ln in lines]
+                    m["updated"] = now_iso()
+                    save_memory(m)
+                elif action == "off":
+                    m["disabled"] = True
+                    save_memory(m)
+                elif action != "show":
+                    return self._send(400, {"error": "bad action"})
+                self._send(200, {
+                    "stats": memory_stats_lines(),
+                    "facts": [f["text"] for f in m.get("facts", []) if f.get("text")],
+                    "disabled": bool(m.get("disabled"))})
+            elif self.path == "/api/voice":
+                v = load_voice()
+                action = body.get("action", "show")
+                if action == "setup":
+                    answers = {k: str(a).strip() for k, a in
+                               (body.get("answers") or {}).items() if str(a).strip()}
+                    samples = [s for s in (body.get("samples") or []) if s.strip()]
+                    if not answers and not samples:
+                        return self._send(
+                            400, {"error": "Nothing to build a profile from."})
+                    profile = _derive_profile(answers, samples)
+                    v = {"profile": profile, "answers": answers, "samples": samples,
+                         "updated": now_iso()}
+                    save_voice(v)
+                elif action == "learn":
+                    sample = (body.get("sample") or "").strip()
+                    if not sample:
+                        return self._send(400, {"error": "Nothing pasted."})
+                    samples = v.get("samples", [])
+                    samples.append(sample)
+                    v["samples"] = samples[-10:]  # keep the freshest 10
+                    v["profile"] = _derive_profile(v.get("answers", {}), v["samples"])
+                    v["updated"] = now_iso()
+                    save_voice(v)
+                elif action == "edit":
+                    profile = (body.get("profile") or "").strip()
+                    if not profile:
+                        return self._send(400, {"error": "Empty profile — not saved."})
+                    v["profile"] = profile
+                    v["updated"] = now_iso()
+                    save_voice(v)
+                elif action == "off":
+                    v = {}
+                    save_voice(v)
+                elif action != "show":
+                    return self._send(400, {"error": "bad action"})
+                self._send(200, {
+                    "profile": v.get("profile", ""),
+                    "samples_count": len(v.get("samples", [])),
+                    "updated": v.get("updated", ""),
+                    "questions": VOICE_QUESTIONS})
+            elif self.path == "/api/project":
+                key = project_key(body.get("name"))
+                action = body.get("action", "show")
+                p = load_project(key)
+                if action == "setup":
+                    root = project_root()
+                    profile, source = _derive_project(root)
+                    p = {"profile": profile, "root": root, "source": source,
+                         "updated": now_iso()}
+                    save_project(key, p)
+                elif action == "edit":
+                    profile = (body.get("profile") or "").strip()
+                    if not profile:
+                        return self._send(400, {"error": "Empty profile — not saved."})
+                    p = {"profile": profile, "root": p.get("root", project_root()),
+                         "source": "edit", "updated": now_iso()}
+                    save_project(key, p)
+                elif action == "ls":
+                    return self._send(200, {"projects": [
+                        {"key": k, "chars": len(load_project(k).get("profile", "")),
+                         "current": k == key}
+                        for k in list_projects()]})
+                elif action == "off":
+                    if p:
+                        os.remove(project_path(key))
+                    p = {}
+                elif action != "show":
+                    return self._send(400, {"error": "bad action"})
+                out = {"key": key, "profile": p.get("profile", ""),
+                       "source": p.get("source", ""), "root": p.get("root", ""),
+                       "updated": p.get("updated", "")}
+                if not p.get("profile"):
+                    ctx, ctx_source = resolve_project_context()
+                    if ctx:
+                        out.update(profile=ctx, source=ctx_source, fallback=True)
+                seed = p.get("profile")
+                if not seed:
+                    seed, _ = resolve_project_context(budget=MAX_CONTEXT_CHARS)
+                out["edit_seed"] = seed or PROJECT_SKELETON
+                self._send(200, out)
+            elif self.path == "/api/pr":
+                action = body.get("action", "review")
+                if action == "review":
+                    diff = body.get("diff") or ""
+                    if diff.strip():
+                        source = "ui paste"
+                    else:
+                        diff, source = git_working_diff()
+                        if not diff:
+                            return self._send(400, {"error":
+                                "No diff. Paste one, or stage changes in "
+                                + project_root() + "."})
+                    session = run_pr_review(
+                        diff, source, body.get("name") or None,
+                        body.get("project") or None, body.get("no_project", False))
+                    return self._send(200, session)
+                if action not in ("resume", "check"):
+                    return self._send(400, {"error": "bad action"})
+                path = (pr_session_path(body["name"]) if body.get("name")
+                        else _latest_session_path())
+                if path and not os.path.exists(path):
+                    path = _latest_session_path()
+                s = load_json(path, None) if path else None
+                if s is None:
+                    return self._send(404, {"error":
+                        "No PR sessions yet. Run a review first."})
+                if action == "check":
+                    idx = int(body.get("n", 0)) - 1
+                    if not (0 <= idx < len(s["checklist"])):
+                        return self._send(400, {"error": f"No checklist item {idx + 1}"})
+                    s["checklist"][idx]["done"] = True
+                    save_json(path, s)
+                self._send(200, s)
             else:
                 self._send(404, {"error": "not found"})
         except NoModelError as e:
             self._send(503, {"error": str(e)})
         except ModelReplyError as e:
             self._send(502, {"error": str(e)})
+        except SystemExit as e:  # a CLI-shaped helper leaked; don't kill the thread
+            self._send(500, {"error": f"unexpected exit: {e}"})
         except Exception as e:  # keep the local server alive
             self._send(500, {"error": f"{type(e).__name__}: {e}"})
 
@@ -1792,6 +2008,18 @@ margin-top:10px;font:inherit;font-size:.92rem;color:#123a5c;}
 .two{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
 @media(max-width:900px){.two{grid-template-columns:1fr;}}
 .muted{color:var(--soft);font-size:.85rem;}
+input[type=text],input[type=number]{font:inherit;font-size:.88rem;border:1px solid var(--border);
+border-radius:8px;padding:5px 8px;background:#fff;color:var(--ink);}
+details.panel summary{cursor:pointer;font-size:1rem;font-weight:700;}
+details.panel summary .muted{font-weight:400;}
+details.sub{margin-top:10px;}
+details.sub summary{cursor:pointer;font-size:.88rem;font-weight:600;color:var(--accent);}
+details.sub>*{margin-top:8px;}
+.facts li,.risks li{margin:2px 0 2px 18px;font-size:.9rem;}
+.check label{display:flex;gap:7px;font-size:.9rem;padding:2px 0;align-items:flex-start;cursor:pointer;}
+.check .done{opacity:.55;text-decoration:line-through;}
+.here{color:var(--green);font-weight:700;}
+.warn{color:var(--amber);font-weight:600;font-size:.9rem;}
 </style>
 </head>
 <body>
@@ -1808,11 +2036,29 @@ margin-top:10px;font:inherit;font-size:.92rem;color:#123a5c;}
   </div>
 
   <div class="one">
-    <div class="label">Do this one thing</div>
+    <div class="label">Do this one thing
+      <label class="muted" style="cursor:pointer;float:right;text-transform:none;letter-spacing:0">
+        <input type="checkbox" id="lowEnergy" onchange="renderOne()"> low energy — smallest first</label></div>
     <div class="thing" id="oneThing">Loading…</div>
     <div class="from" id="oneFrom"></div>
+    <div class="muted" id="oneWhy"></div>
     <button class="primary" id="doneBtn" style="display:none">Done ✓</button>
-    <button id="timerBtn">Start 25-min timer</button><span class="timer" id="timerTxt"></span>
+    <button id="timerBtn">Start timer</button>
+    <input type="number" id="timerMin" value="25" min="1" max="180" style="width:64px" title="minutes"><span class="muted"> min</span>
+    <span class="timer" id="timerTxt"></span>
+  </div>
+
+  <div class="row" style="margin:0 0 12px">
+    <input type="text" id="addTitle" placeholder="add a task…" style="flex:1;min-width:180px">
+    <select id="addPri"><option value="1">high</option><option value="2" selected>med</option>
+      <option value="3">low</option></select>
+    <input type="number" id="addEst" placeholder="est. min" style="width:88px" min="1">
+    <select id="addStatus"><option>inbox</option><option>now</option><option>next</option>
+      <option>later</option></select>
+    <input type="text" id="addNotes" placeholder="notes (optional)" style="width:170px">
+    <button class="primary" onclick="doAdd()">Add</button>
+    <label class="muted" style="cursor:pointer;margin-left:auto">
+      <input type="checkbox" id="showDone" onchange="renderBoard()"> show done</label>
   </div>
 
   <div class="cols" id="board"></div>
@@ -1833,6 +2079,9 @@ margin-top:10px;font:inherit;font-size:.92rem;color:#123a5c;}
         <option value="pr-comment">PR comment</option><option value="standup">Standup</option></select>
         <select id="draftTone"><option value="friendly">Friendly</option>
         <option value="neutral">Neutral</option><option value="firm">Firm</option></select>
+        <input type="text" id="draftTo" placeholder="to (optional)" style="width:110px">
+        <label class="muted" style="cursor:pointer" title="treat the input as a draft to clean up, not bullets">
+          <input type="checkbox" id="draftPolish"> polish</label>
         <label class="muted" id="voiceWrap" style="display:none;cursor:pointer">
           <input type="checkbox" id="voiceUse" checked> in my voice</label>
         <button class="primary" onclick="doDraft()">Draft it</button>
@@ -1841,6 +2090,47 @@ margin-top:10px;font:inherit;font-size:.92rem;color:#123a5c;}
       <pre class="out" id="draftOut" style="display:none"></pre>
     </div>
   </div>
+
+  <details class="panel" id="triagePanel">
+    <summary>Triage <span class="muted" id="triageCount">no stale tasks</span></summary>
+    <p class="muted" style="margin-top:8px">Inbox/later tasks untouched for a fortnight.
+      Keep freshens them, drop lets them go — deciding either way counts.</p>
+    <div id="triageList"></div>
+  </details>
+
+  <details class="panel" id="prPanel">
+    <summary>PR review <span class="muted">summarise a diff, get a checklist</span></summary>
+    <textarea id="prDiff" placeholder="paste a unified diff… (or use the repo button below)" style="margin-top:10px"></textarea>
+    <div class="row">
+      <input type="text" id="prName" placeholder="session name (optional)" style="width:180px">
+      <button class="primary" id="prPasteBtn" onclick="doPr('paste')">Review pasted diff</button>
+      <button id="prGitBtn" onclick="doPr('git')">Review changes in repo</button>
+      <button onclick="doPr('resume')">Resume last session</button>
+      <label class="muted" style="cursor:pointer"><input type="checkbox" id="prNoProject"> skip project context</label>
+      <span class="muted" id="prStatus"></span>
+    </div>
+    <div id="prOut"></div>
+  </details>
+
+  <details class="panel" id="voicePanel">
+    <summary>Voice <span class="muted" id="voiceSummary">how drafts sound like you</span></summary>
+    <div id="voiceBody" class="muted">open to load…</div>
+  </details>
+
+  <details class="panel" id="memoryPanel">
+    <summary>Memory <span class="muted" id="memorySummary">facts the AI knows about you</span></summary>
+    <div id="memoryBody" class="muted">open to load…</div>
+  </details>
+
+  <details class="panel" id="projectPanel">
+    <summary>Project <span class="muted" id="projectSummary">what the AI knows about this repo</span></summary>
+    <div id="projectBody" class="muted">open to load…</div>
+  </details>
+
+  <details class="panel" id="settingsPanel">
+    <summary>Doctor <span class="muted">data &amp; model</span></summary>
+    <div id="settingsBody" class="muted" style="margin-top:8px"></div>
+  </details>
 </div>
 <script>
 let state={tasks:[],next_id:null,llm:false};
@@ -1855,13 +2145,20 @@ async function api(path,body){
 }
 async function refresh(){
   state=await api("/api/state");
-  document.getElementById("llmBadge").className="llm "+(state.llm?"ok":"off");
-  document.getElementById("llmBadge").textContent=state.llm?"local model connected":"no model — AI features off";
+  const badge=document.getElementById("llmBadge");
+  badge.className="llm "+(state.llm?"ok":"off");
+  badge.textContent=state.llm?"local model — "+((state.model||{}).model||"connected")
+    :"no model — AI features off";
+  badge.title=state.llm?((state.model||{}).runtime+" at "+(state.model||{}).endpoint)
+    :((state.model||{}).error||"");
   document.getElementById("voiceWrap").style.display=state.voice?"inline":"none";
   document.getElementById("projectWrap").style.display=state.project?"inline":"none";
   document.getElementById("projectSrc").textContent=state.project;
   document.getElementById("memoryWrap").style.display=state.memory?"inline":"none";
-  renderOne();renderBoard();renderDone();
+  document.getElementById("prPasteBtn").disabled=!state.llm;
+  document.getElementById("prGitBtn").disabled=!state.llm;
+  document.getElementById("prGitBtn").textContent="Review changes in "+(state.root||"repo");
+  renderOne();renderBoard();renderDone();renderTriage();renderSettings();
 }
 // one toggle for every AI panel — project context is a property of the repo, not the panel
 function noProject(){const b=document.getElementById("projectUse");return !!b&&!b.checked;}
@@ -1872,8 +2169,13 @@ function renderDone(){
   p.style.display="block";
   document.getElementById("doneCount").textContent=d.length;
   document.getElementById("doneList").textContent=
-    d.map(x=>"#"+x.id+" "+x.title).join("  ·  ")+
-    (state.streak>1?"   —  "+state.streak+"-day streak":"");
+    d.map(x=>{
+      const c=[x.est?"est ~"+x.est+"m":"",x.actual?"took ~"+x.actual+"m":""]
+        .filter(Boolean).join(" · ");
+      return "#"+x.id+" "+x.title+(c?" ("+c+")":"");
+    }).join("  ·  ")+
+    (state.streak>1?"   —  "+state.streak+"-day streak":"")+
+    (state.ratio?"   —  tasks take ~"+state.ratio.toFixed(1)+"x your estimates":"");
 }
 function nextAction(t){
   if(!t)return null;
@@ -1881,11 +2183,20 @@ function nextAction(t){
     return{text:t.subtasks[i].text,sub:i,est:t.subtasks[i].estimate_min};
   return{text:t.title,sub:null,est:t.estimate_min};
 }
+function remainingEst(t){
+  const subs=t.subtasks.filter(s=>!s.done&&s.estimate_min);
+  if(subs.length)return subs.reduce((a,s)=>a+s.estimate_min,0);
+  return t.estimate_min;
+}
 function renderOne(){
-  const t=state.tasks.find(x=>x.id===state.next_id);
+  const low=document.getElementById("lowEnergy").checked;
+  const t=state.tasks.find(x=>x.id===(low?state.next_low_id:state.next_id));
   const el=document.getElementById("oneThing"),from=document.getElementById("oneFrom"),
-    btn=document.getElementById("doneBtn");
-  if(!t){el.textContent="Nothing on the list — enjoy it.";from.textContent="";btn.style.display="none";return;}
+    btn=document.getElementById("doneBtn"),why=document.getElementById("oneWhy");
+  if(!t){el.textContent="Nothing on the list — enjoy it.";from.textContent="";
+    why.textContent="";btn.style.display="none";return;}
+  why.textContent="chosen because: status="+t.status+", priority="+PRI[t.priority]+
+    ", remaining ~"+(remainingEst(t)||"?")+"m, "+(low?"smallest":"oldest")+" first";
   const a=nextAction(t);
   el.textContent=a.text+(a.est?"  (~"+a.est+"m)":"");
   from.textContent=a.sub!==null?("from #"+t.id+" "+t.title):("task #"+t.id);
@@ -1896,21 +2207,42 @@ function renderOne(){
     refresh();
   };
 }
+function calib(t){
+  const est=t.estimate_min||t.subtasks.reduce((a,s)=>a+(s.estimate_min||0),0)||null;
+  let took=null;
+  if(t.started&&t.completed){
+    const m=Math.max(1,Math.round((Date.parse(t.completed)-Date.parse(t.started))/60000));
+    if(m<=480)took=m;
+  }
+  if(!est&&!took)return"";
+  return(est?"est ~"+est+"m":"")+(est&&took?" · ":"")+(took?"took ~"+took+"m":"");
+}
+function staleList(){
+  const days=state.stale_days||14;
+  return state.tasks
+    .filter(t=>(t.status==="inbox"||t.status==="later")&&
+      (Date.now()-Date.parse(t.updated||t.created))/86400000>=days)
+    .sort((a,b)=>(a.updated||a.created)<(b.updated||b.created)?-1:1);
+}
 function renderBoard(){
   const board=document.getElementById("board");board.innerHTML="";
-  for(const st of STATUSES){
+  const cols=document.getElementById("showDone").checked?STATUSES.concat("done"):STATUSES;
+  board.style.gridTemplateColumns="repeat("+cols.length+",1fr)";
+  for(const st of cols){
     const col=document.createElement("div");col.className="col";
     col.innerHTML="<h2>"+st+"</h2>";
     for(const t of state.tasks.filter(x=>x.status===st)){
       const d=document.createElement("div");d.className="task";
       const doneSubs=t.subtasks.filter(s=>s.done).length;
       const age=Math.floor((Date.now()-Date.parse(t.updated||t.created))/86400000);
-      const stale=(st==="inbox"||st==="later")&&age>=14;
+      const stale=(st==="inbox"||st==="later")&&age>=(state.stale_days||14);
       const note=lastNote(t);
+      const cal=st==="done"?calib(t):"";
       d.innerHTML='<div class="t">#'+t.id+" "+esc(t.title)+'</div>'+
         '<div class="meta"><span class="pri'+t.priority+'">'+PRI[t.priority]+"</span>"+
         (t.subtasks.length?" · "+doneSubs+"/"+t.subtasks.length+" steps":"")+
-        (stale?' · <span class="stale">'+age+'d old</span>':"")+"</div>"+
+        (stale?' · <span class="stale">'+age+'d old</span>':"")+
+        (cal?" · "+esc(cal):"")+"</div>"+
         (note?'<div class="lastnote">'+esc(note)+'</div>':"");
       if(t.subtasks.length){
         const subs=document.createElement("div");subs.className="subs";
@@ -1926,7 +2258,10 @@ function renderBoard(){
       }
       const act=document.createElement("div");act.className="actions";
       if(!t.subtasks.length&&state.llm)addBtn(act,"break down",async()=>{
-        await api("/api/break",{id:t.id,no_project:noProject(),no_memory:noMemory()});refresh();});
+        const h=prompt("Optional hint for the breakdown (leave empty to skip):");
+        if(h===null)return;
+        await api("/api/break",{id:t.id,hint:h.trim(),
+          no_project:noProject(),no_memory:noMemory()});refresh();});
       for(const to of STATUSES.filter(x=>x!==st))
         addBtn(act,"→ "+to,async()=>{await api("/api/update",{id:t.id,status:to});refresh();});
       addBtn(act,"note",async()=>{
@@ -1961,29 +2296,314 @@ async function doDraft(){
   try{const r=await api("/api/draft",{text:t.value,
       type:document.getElementById("draftType").value,
       tone:document.getElementById("draftTone").value,
+      to:document.getElementById("draftTo").value.trim(),
+      polish:document.getElementById("draftPolish").checked,
       no_voice:!document.getElementById("voiceUse").checked,
       no_project:noProject(),no_memory:noMemory()});
     o.style.display="block";o.textContent=r.message;s.textContent="";}
   catch(e){s.textContent=e.message;}
 }
+async function doAdd(){
+  const title=document.getElementById("addTitle"),est=document.getElementById("addEst"),
+    notes=document.getElementById("addNotes");
+  if(!title.value.trim())return;
+  await api("/api/add",{title:title.value,
+    priority:Number(document.getElementById("addPri").value),
+    status:document.getElementById("addStatus").value,
+    estimate_min:est.value?Number(est.value):null,
+    notes:notes.value.trim()});
+  title.value="";est.value="";notes.value="";refresh();
+}
+// --- triage: the CLI's k/l/d/x walkthrough as a list, non-blocking
+async function doTriage(id,decision){
+  if(decision==="drop"&&!confirm("Drop #"+id+" for good?"))return;
+  await api("/api/triage",{id:id,decision:decision});refresh();
+}
+function renderTriage(){
+  const list=staleList(),el=document.getElementById("triageList"),
+    c=document.getElementById("triageCount");
+  c.textContent=list.length?list.length+" stale":"no stale tasks";
+  el.innerHTML="";
+  for(const t of list){
+    const d=document.createElement("div");d.className="task";
+    const age=Math.floor((Date.now()-Date.parse(t.updated||t.created))/86400000);
+    d.innerHTML='<div class="t">#'+t.id+" "+esc(t.title)+'</div>'+
+      '<div class="meta">'+t.status+' · <span class="stale">'+age+'d untouched</span></div>';
+    const act=document.createElement("div");act.className="actions";
+    addBtn(act,"keep",()=>doTriage(t.id,"keep"));
+    addBtn(act,"→ later",()=>doTriage(t.id,"later"));
+    addBtn(act,"done ✓",()=>doTriage(t.id,"done"));
+    addBtn(act,"drop ✕",()=>doTriage(t.id,"drop"));
+    d.appendChild(act);el.appendChild(d);
+  }
+}
+// --- pr review
+let prName=null;
+async function doPr(mode){
+  const s=document.getElementById("prStatus");
+  const body={action:mode==="resume"?"resume":"review",
+    name:document.getElementById("prName").value.trim()};
+  if(mode==="paste"){
+    const d=document.getElementById("prDiff").value;
+    if(!d.trim()){s.textContent="paste a diff first";return;}
+    body.diff=d;
+  }
+  if(mode!=="resume"){
+    body.no_project=document.getElementById("prNoProject").checked;
+    s.textContent="reviewing… (local models take a minute)";
+  }
+  try{const r=await api("/api/pr",body);s.textContent="";renderPr(r);
+    document.getElementById("prOut").scrollIntoView({behavior:"smooth",block:"nearest"});}
+  catch(e){s.textContent=e.message;}
+}
+async function prCheck(n){
+  try{renderPr(await api("/api/pr",{action:"check",n:n,name:prName}));}
+  catch(e){document.getElementById("prStatus").textContent=e.message;}
+}
+function renderPr(sn){
+  prName=sn.name;
+  const o=document.getElementById("prOut");o.innerHTML="";
+  const head=document.createElement("div");head.className="muted";
+  head.style.marginTop="10px";
+  head.textContent=sn.name+" · from "+sn.source+
+    (sn.project?" · context: "+sn.project.source+" ("+sn.project.chars+" chars)":"");
+  o.appendChild(head);
+  const sum=document.createElement("pre");sum.className="out";
+  sum.textContent=sn.summary;o.appendChild(sum);
+  if(sn.truncated){const w=document.createElement("div");w.className="warn";
+    w.textContent="!! Diff was truncated — large PR. Review the tail manually.";
+    o.appendChild(w);}
+  if((sn.risks||[]).length){
+    const h=document.createElement("div");h.className="muted";
+    h.style.marginTop="6px";h.textContent="Look hardest at:";o.appendChild(h);
+    const ul=document.createElement("ul");ul.className="risks";
+    for(const r of sn.risks){const li=document.createElement("li");
+      li.textContent=r;ul.appendChild(li);}
+    o.appendChild(ul);
+  }
+  const chk=document.createElement("div");chk.className="check";
+  chk.style.marginTop="8px";
+  let here=false;
+  sn.checklist.forEach((c,i)=>{
+    const l=document.createElement("label");if(c.done)l.className="done";
+    const b=document.createElement("input");b.type="checkbox";
+    b.checked=c.done;b.disabled=c.done;
+    b.onchange=()=>prCheck(i+1);
+    l.appendChild(b);
+    l.appendChild(document.createTextNode(c.file+": "+c.item));
+    if(!c.done&&!here){here=true;
+      const m=document.createElement("span");m.className="here";
+      m.textContent=" ← you are here";l.appendChild(m);}
+    chk.appendChild(l);
+  });
+  o.appendChild(chk);
+  const done=sn.checklist.filter(c=>c.done).length;
+  const prog=document.createElement("div");prog.className="muted";
+  prog.textContent=done+"/"+sn.checklist.length+" done";
+  o.appendChild(prog);
+}
+// --- voice
+async function loadVoice(){
+  try{renderVoice(await api("/api/voice",{action:"show"}));}
+  catch(e){document.getElementById("voiceSummary").textContent=e.message;}
+}
+async function doVoice(body,confirmMsg){
+  if(confirmMsg&&!confirm(confirmMsg))return;
+  const s=document.getElementById("voiceSummary");
+  if(body.action==="setup"||body.action==="learn")s.textContent="deriving profile…";
+  try{renderVoice(await api("/api/voice",body));refresh();}
+  catch(e){s.textContent=e.message;}
+}
+function renderVoice(v){
+  const el=document.getElementById("voiceBody"),
+    s=document.getElementById("voiceSummary");
+  s.textContent=v.profile
+    ?"built from "+v.samples_count+" sample(s), updated "+(v.updated||"?").slice(0,10)
+    :"no profile yet";
+  el.innerHTML="";el.className="";
+  if(v.profile){
+    const pre=document.createElement("pre");pre.className="out";
+    pre.textContent=v.profile;el.appendChild(pre);
+    const learn=document.createElement("details");learn.className="sub";
+    learn.innerHTML="<summary>Teach it a real message</summary>";
+    const lta=document.createElement("textarea");
+    lta.placeholder="paste a message you actually sent…";learn.appendChild(lta);
+    const lrow=document.createElement("div");lrow.className="row";
+    addBtn(lrow,"Learn from this",()=>{
+      if(lta.value.trim())doVoice({action:"learn",sample:lta.value});});
+    learn.appendChild(lrow);el.appendChild(learn);
+    const ed=document.createElement("details");ed.className="sub";
+    ed.innerHTML="<summary>Edit the profile</summary>";
+    const eta=document.createElement("textarea");eta.value=v.profile;
+    eta.style.minHeight="140px";ed.appendChild(eta);
+    const erow=document.createElement("div");erow.className="row";
+    addBtn(erow,"Save profile",()=>doVoice({action:"edit",profile:eta.value}));
+    ed.appendChild(erow);el.appendChild(ed);
+  }
+  const su=document.createElement("details");su.className="sub";
+  su.innerHTML="<summary>"+(v.profile?"Redo the interview"
+    :"Set up your voice — 8 quick questions, skip any")+"</summary>";
+  const inputs={};
+  for(const qa of v.questions){
+    const l=document.createElement("label");l.style.display="block";
+    l.style.marginTop="6px";l.className="muted";l.textContent=qa[1];
+    const inp=document.createElement("input");inp.type="text";inp.style.width="100%";
+    inputs[qa[0]]=inp;su.appendChild(l);su.appendChild(inp);
+  }
+  const sta=document.createElement("textarea");
+  sta.placeholder="optional but powerful: paste 1-3 real messages you have sent…";
+  su.appendChild(sta);
+  const srow=document.createElement("div");srow.className="row";
+  addBtn(srow,"Build profile",()=>{
+    const answers={};
+    for(const k in inputs)if(inputs[k].value.trim())answers[k]=inputs[k].value.trim();
+    doVoice({action:"setup",answers:answers,
+      samples:sta.value.trim()?[sta.value.trim()]:[]});
+  });
+  su.appendChild(srow);el.appendChild(su);
+  if(v.profile){
+    const row=document.createElement("div");row.className="row";
+    addBtn(row,"Clear voice profile",()=>doVoice({action:"off"},
+      "This deletes the profile AND its samples and answers. Sure?"));
+    el.appendChild(row);
+  }
+}
+// --- memory
+async function loadMemory(){
+  try{renderMemory(await api("/api/memory",{action:"show"}));}
+  catch(e){document.getElementById("memorySummary").textContent=e.message;}
+}
+async function doMemory(body,confirmMsg){
+  if(confirmMsg&&!confirm(confirmMsg))return;
+  try{renderMemory(await api("/api/memory",body));refresh();}
+  catch(e){document.getElementById("memorySummary").textContent=e.message;}
+}
+function renderMemory(m){
+  const el=document.getElementById("memoryBody"),
+    s=document.getElementById("memorySummary");
+  s.textContent=m.disabled?"off — facts kept, not injected"
+    :(m.facts.length||m.stats.length?"used by dump / break / draft"
+      :"nothing remembered yet");
+  el.innerHTML="";el.className="";
+  if(m.stats.length||m.facts.length){
+    const ul=document.createElement("ul");ul.className="facts";
+    for(const x of m.stats){const li=document.createElement("li");
+      li.className="muted";li.textContent=x+"  (derived from history)";
+      ul.appendChild(li);}
+    for(const x of m.facts){const li=document.createElement("li");
+      li.textContent=x;ul.appendChild(li);}
+    el.appendChild(ul);
+  }else{
+    const p=document.createElement("div");p.className="muted";
+    p.textContent="Nothing remembered yet — estimate patterns appear on their own as you finish tasks.";
+    el.appendChild(p);
+  }
+  const row=document.createElement("div");row.className="row";
+  const inp=document.createElement("input");inp.type="text";
+  inp.placeholder="a fact worth remembering…";inp.style.flex="1";
+  row.appendChild(inp);
+  addBtn(row,"Remember",()=>{if(inp.value.trim())doMemory({action:"add",text:inp.value});});
+  if(m.disabled){
+    const note=document.createElement("span");note.className="muted";
+    note.textContent="adding a fact switches memory back on";row.appendChild(note);
+  }else addBtn(row,"Turn off (facts kept)",()=>doMemory({action:"off"}));
+  el.appendChild(row);
+  const ed=document.createElement("details");ed.className="sub";
+  ed.innerHTML="<summary>Edit all facts</summary>";
+  const ta=document.createElement("textarea");ta.value=m.facts.join("\n");
+  ta.placeholder="one fact per line";ed.appendChild(ta);
+  const erow=document.createElement("div");erow.className="row";
+  addBtn(erow,"Save facts",()=>doMemory({action:"edit",text:ta.value},
+    "Replace ALL stored facts with this list?"));
+  ed.appendChild(erow);el.appendChild(ed);
+}
+// --- project
+async function loadProject(){
+  try{
+    const p=await api("/api/project",{action:"show"});
+    const l=await api("/api/project",{action:"ls"});
+    renderProject(p,l.projects||[]);
+  }catch(e){document.getElementById("projectSummary").textContent=e.message;}
+}
+async function doProject(body,confirmMsg){
+  if(confirmMsg&&!confirm(confirmMsg))return;
+  const s=document.getElementById("projectSummary");
+  if(body.action==="setup")s.textContent="reading the repo + distilling… can take a minute";
+  try{await api("/api/project",body);await loadProject();refresh();}
+  catch(e){s.textContent=e.message;}
+}
+function renderProject(p,projects){
+  const el=document.getElementById("projectBody"),
+    s=document.getElementById("projectSummary");
+  s.textContent=p.profile?(p.key+" via "+p.source+(p.fallback?" (fallback)":""))
+    :"no context for "+p.key;
+  el.innerHTML="";el.className="";
+  if(p.profile){
+    const pre=document.createElement("pre");pre.className="out";
+    pre.textContent=p.profile;el.appendChild(pre);
+    const meta=document.createElement("div");meta.className="muted";
+    meta.textContent=p.fallback
+      ?"no saved profile — falling back to "+p.source+". Build one to distil it."
+      :"from "+(p.root||"?")+" via "+p.source+", updated "+(p.updated||"?").slice(0,10);
+    el.appendChild(meta);
+  }
+  const row=document.createElement("div");row.className="row";
+  addBtn(row,"Build profile from this repo",()=>doProject({action:"setup"}));
+  if(p.profile&&!p.fallback)
+    addBtn(row,"Clear saved profile",()=>doProject({action:"off"},
+      "Delete the saved profile for "+p.key+"? Repo docs (CLAUDE.md/README) still apply as fallback."));
+  el.appendChild(row);
+  const ed=document.createElement("details");ed.className="sub";
+  ed.innerHTML="<summary>Edit the profile</summary>";
+  const ta=document.createElement("textarea");ta.value=p.edit_seed||"";
+  ta.style.minHeight="140px";ed.appendChild(ta);
+  const erow=document.createElement("div");erow.className="row";
+  addBtn(erow,"Save profile",()=>doProject({action:"edit",profile:ta.value}));
+  ed.appendChild(erow);el.appendChild(ed);
+  if(projects.length){
+    const h=document.createElement("div");h.className="muted";
+    h.style.marginTop="8px";h.textContent="Saved profiles:";el.appendChild(h);
+    const ul=document.createElement("ul");ul.className="facts";
+    for(const pr of projects){const li=document.createElement("li");
+      li.textContent=pr.key+" ("+pr.chars+" chars)"+(pr.current?" ← here":"");
+      ul.appendChild(li);}
+    el.appendChild(ul);
+  }
+}
+// --- doctor
+function renderSettings(){
+  const el=document.getElementById("settingsBody");
+  const open=state.tasks.filter(t=>t.status!=="done").length;
+  const m=state.model||{};
+  el.style.whiteSpace="pre-wrap";
+  el.textContent=["data dir : "+(state.home||"?"),
+    "tasks    : "+open+" open / "+state.tasks.length+" total",
+    state.llm?"model    : OK — "+m.runtime+" at "+m.endpoint+" (model: "+m.model+")"
+      :"model    : NOT FOUND — "+(m.error||"")].join("\n");
+}
+document.getElementById("voicePanel").addEventListener("toggle",e=>{if(e.target.open)loadVoice();});
+document.getElementById("memoryPanel").addEventListener("toggle",e=>{if(e.target.open)loadMemory();});
+document.getElementById("projectPanel").addEventListener("toggle",e=>{if(e.target.open)loadProject();});
 // Timer state lives in localStorage as an end-timestamp, so a reload (or closing the
 // tab mid-pomodoro) never loses a running timer.
 let timer=null;
 function timerEnd(){return Number(localStorage.getItem("focusTimerEnd")||0);}
 function setTimerEnd(ts){ts?localStorage.setItem("focusTimerEnd",ts)
   :localStorage.removeItem("focusTimerEnd");}
+function timerMins(){return Number(localStorage.getItem("focusTimerMin")||25);}
 function tickTimer(){
   const btn=document.getElementById("timerBtn"),txt=document.getElementById("timerTxt");
   const end=timerEnd();
   if(!end){if(timer){clearInterval(timer);timer=null;}
-    btn.textContent="Start 25-min timer";return;}
+    btn.textContent="Start timer";return;}
   const left=Math.round((end-Date.now())/1000);
   if(left<=0){
+    const mins=timerMins();
     setTimerEnd(0);clearInterval(timer);timer=null;
-    txt.textContent="break time!";btn.textContent="Start 25-min timer";
+    txt.textContent="break time!";btn.textContent="Start timer";
     if("Notification" in window&&Notification.permission==="granted")
-      new Notification("focus",{body:"25 minutes up — take a break."});
-    api("/api/timer",{event:"timer_done",minutes:25}).catch(()=>{});
+      new Notification("focus",{body:mins+" minutes up — take a break."});
+    api("/api/timer",{event:"timer_done",minutes:mins}).catch(()=>{});
     return;
   }
   txt.textContent=String(Math.floor(left/60)).padStart(2,"0")+":"+
@@ -1992,12 +2612,14 @@ function tickTimer(){
 }
 document.getElementById("timerBtn").onclick=()=>{
   if(timerEnd()){setTimerEnd(0);document.getElementById("timerTxt").textContent="";
-    api("/api/timer",{event:"timer_cancel",minutes:25}).catch(()=>{});
+    api("/api/timer",{event:"timer_cancel",minutes:timerMins()}).catch(()=>{});
     tickTimer();return;}
   if("Notification" in window&&Notification.permission==="default")
     Notification.requestPermission();
-  setTimerEnd(Date.now()+25*60*1000);
-  api("/api/timer",{event:"timer_start",minutes:25}).catch(()=>{});
+  const mins=Math.max(1,Number(document.getElementById("timerMin").value)||25);
+  localStorage.setItem("focusTimerMin",mins);
+  setTimerEnd(Date.now()+mins*60*1000);
+  api("/api/timer",{event:"timer_start",minutes:mins}).catch(()=>{});
   timer=setInterval(tickTimer,1000);tickTimer();
 };
 if(timerEnd()){timer=setInterval(tickTimer,1000);tickTimer();}

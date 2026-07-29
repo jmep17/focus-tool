@@ -128,14 +128,24 @@ subtasks, and logs the `done` event, and it is shared by `cmd_done`, `cmd_move`,
 silently breaks `focus today`, streaks and calibration. `cmd_start` and the UI's
 move-to-now stamp `started` on first start only.
 
-**UI duplicates CLI logic.** `UIHandler` re-implements break/dump/draft against the same
-prompts rather than calling the `cmd_*` functions (which print and `SystemExit`). A change to
-any AI feature usually needs the same edit in both places — the tests exercise both. The
-dashboard is one raw string, `UI_HTML`, with inline CSS/JS and no build step. `NoModelError`
-maps to 503, `ModelReplyError` to 502, and everything else to 500 so the local server
-stays up. `do_POST` rejects requests whose `Host`/`Origin` isn't local (`_origin_ok`) —
-a text/plain form post from any webpage reaches the handler otherwise, so don't remove
-the check when adding endpoints.
+**UI duplicates CLI logic.** `UIHandler` re-implements every feature against the same
+prompts and shared helpers rather than calling the `cmd_*` functions (which print and
+`SystemExit`). A change to any AI feature usually needs the same edit in both places — the
+tests exercise both. The dashboard is one raw string, `UI_HTML`, with inline CSS/JS and no
+build step (so no `"""` inside it). `NoModelError` maps to 503, `ModelReplyError` to 502,
+and everything else — including a leaked `SystemExit`, which the handler traps separately
+because it is a `BaseException` that would otherwise kill the thread — to 500 so the local
+server stays up. `do_POST` rejects requests whose `Host`/`Origin` isn't local
+(`_origin_ok`) — a text/plain form post from any webpage reaches the handler otherwise, so
+don't remove the check when adding endpoints.
+
+Feature areas each get one multiplexed POST route dispatching on an `action` field
+(`/api/pr`, `/api/triage`, `/api/memory`, `/api/voice`, `/api/project`), mirroring the
+CLI's verbs; panel bodies lazy-load via `action: "show"` on open, and nothing heavy (pr
+sessions, profile text, `repo_brief`) is ever added to the 5-second `/api/state` poll.
+The UI must never call `get_diff()` — its stdin tier blocks a server thread forever;
+`git_working_diff()` is the UI-safe extraction, just as `run_pr_review()` /
+`_latest_session_path()` are the print-free, SystemExit-free cores shared with `cmd_pr`.
 
 ## Constraints
 
