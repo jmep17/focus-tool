@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "focus-cli"
+version = "0.2.0"
+description = "Local-first ADHD companion for developers — tasks, breakdown, one-thing-next, PR review, drafts in your voice. Talks only to a local model."
+requires-python = ">=3.9"
+license = { text = "MIT" }
+
+[project.scripts]
+focus = "focus:main"
+
+[tool.setuptools]
+py-modules = ["focus"]
