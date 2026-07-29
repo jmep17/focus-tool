@@ -119,6 +119,30 @@ check("pr summary shown", "retry logic" in out, out)
 check("pr risks shown", "double-charge" in out)
 check("pr checklist has position marker", "<- you are here" in out)
 
+# --- the review is markdown, and leads with findings rather than chores
+check("pr output is markdown", "## PR review — test-pr" in out, out)
+check("pr leads with findings", out.index("### Findings") < out.index("### Checklist"), out)
+check("findings carry a severity", "- **bug** `payments/client.py`" in out, out)
+check("findings quote where they are", "`for attempt in range(3):`" in out, out)
+check("checklist is a markdown task list", "- [ ] 1. `payments/client.py` — " in out, out)
+saved_pr = focus.load_json(focus.pr_session_path("test-pr"), None)
+check("session stores structured findings",
+      [f["severity"] for f in saved_pr["findings"]] == ["bug", "nit"], saved_pr["findings"])
+check("an invented severity is normalised", focus.session_findings(
+      {"findings": [{"severity": "SHOWSTOPPER", "what": "x"}]})[0]["severity"] == "risk")
+check("the renderer quotes where once, however the model wrote it",
+      "— `sleep(1)`" in out and "``" not in out, out)
+check("an empty finding is dropped",
+      focus.session_findings({"findings": [{"severity": "bug"}, {"what": "real"}]})
+      == [{"severity": "risk", "file": "", "where": "", "what": "real"}])
+old_session = {"name": "old", "source": "f", "summary": "s", "checklist": [],
+               "risks": ["watch the retry loop"]}
+check("a pre-findings session still renders",
+      "- **risk**" in focus.pr_markdown(old_session)
+      and "watch the retry loop" in focus.pr_markdown(old_session))
+check("nothing flagged says so, and says why to read it anyway",
+      "Nothing flagged" in focus.pr_markdown(dict(old_session, risks=[])))
+
 # --- pr resume + check, verb form
 code, out = run(["pr", "check", "1", "--name", "test-pr"])
 check("pr check ticks item", "[x] 1." in out, out)
@@ -544,6 +568,11 @@ s_pr = json.loads(body)
 check("ui pr review summarises",
       "retry logic" in s_pr["summary"] and len(s_pr["checklist"]) == 2, s_pr)
 check("ui pr session saved", os.path.exists(focus.pr_session_path("ui-pr")))
+check("ui pr review returns findings",
+      s_pr["findings"][0]["file"] == "payments/client.py", s_pr)
+md = json.loads(api("/api/pr", {"action": "markdown", "name": "ui-pr"})[1])["markdown"]
+check("ui hands back the same markdown the CLI prints",
+      md == focus.pr_markdown(focus.load_json(focus.pr_session_path("ui-pr"), None)), md)
 prog = json.loads(api("/api/pr", {"action": "progress"})[1])
 check("ui pr progress ends inactive",
       prog["active"] is False and prog["stage"] == "saved", prog)

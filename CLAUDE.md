@@ -206,6 +206,25 @@ but `focus pr` and must not sit there for a minute × two `gh` invocations. When
 found its title and body ride ahead of the diff in the user message (`_pr_preamble`) —
 cheap, high-signal context the author already wrote.
 
+**A review is findings first, chores second.** `SYS_PR` asks for `findings`
+(`severity` ∈ `SEVERITIES`, `file`, `where`, `what`) — concrete problems quoted out of
+the diff — and demotes `checklist` to what a human can only check by reading *around* it.
+"Zero findings is a respectable answer" is in the prompt on purpose: a model padding a
+clean diff with "consider adding tests" is what made the old output feel like nothing but
+a checklist. `session_findings()` normalises the reply *and* reads sessions written before
+findings existed (a `risks` list of bare strings) — there is no migration layer, so the
+reader converts. It also strips backticks off `file`/`where`: the prompt asks for those two
+bare, and models ignore that, so the renderer would print ` ``sleep(1)`` `.
+
+**`pr_markdown()` is the only renderer.** `print_pr` prints it and `/api/pr`
+`action: "markdown"` serves it to the dashboard's copy button, so what you read in the
+terminal is byte-identical to what lands in a PR comment. Terminal-first markdown: no
+tables, no reference links, nothing that only makes sense once something else renders it.
+The checklist is a GitHub task list (`- [x] 3. …`) because that is also the clearest thing
+to look at raw. Keep `<- you are here`, `N/M done` and the `project context:` / `ticket:`
+provenance wording — the suite matches those substrings, and they are what `pr resume`
+exists to show.
+
 **A review says it is working.** `run_pr_review(progress=...)` emits `context` / `ticket` /
 `diff` with a human-readable line, then `model` repeatedly with the **raw half-written
 reply** — each consumer renders what it wants from it, which is why `_partial_summary()`

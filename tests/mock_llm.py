@@ -40,7 +40,13 @@ def canned_reply(messages):
     if "unified diff" in system:
         return json.dumps({
             "summary": "Adds retry logic to the payment client and covers it with tests.",
-            "risks": ["Retry loop could double-charge if idempotency key is missing"],
+            "findings": [
+                {"severity": "bug", "file": "payments/client.py",
+                 "where": "for attempt in range(3):",
+                 "what": "Retry loop could double-charge if idempotency key is missing"},
+                {"severity": "nit", "file": "payments/client.py",
+                 "where": "`sleep(1)`", "what": "Fixed backoff, no jitter"},
+            ],
             "checklist": [
                 {"file": "payments/client.py", "item": "Verify idempotency key is sent on retries"},
                 {"file": "tests/test_client.py", "item": "Check the retry test asserts call count"},

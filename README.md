@@ -129,9 +129,21 @@ focus pr resume          # after ANY interruption: shows "<- you are here"
 focus pr check 3         # tick item 3 as reviewed
 ```
 
-The model writes a 3-sentence summary, flags where to look hardest, and builds
-a file-by-file checklist. Your position is saved on disk, so a meeting or a
-Slack ping can't wipe your mental state — the checklist *is* the state.
+You get **findings first**: concrete problems quoted out of the diff, each tagged
+`bug` / `risk` / `nit`, worst first — then a 3-sentence summary of what the change
+does, then a checklist of the things only a human can check by running the code.
+Zero findings is an allowed answer; the prompt would rather say nothing than pad.
+Your position in the checklist is saved on disk, so a meeting or a Slack ping
+can't wipe your mental state — the checklist *is* the state.
+
+The whole review is markdown, so it reads well in the terminal and pastes
+straight into the PR. The dashboard's **copy as markdown** button asks the server
+for the same text `focus pr` prints, rather than re-rendering it in the browser.
+
+How good the findings are tracks the model. A 7B model gives you a reading aid; a
+32B coder model gives you review notes. Either way it is a first pass, not a
+reviewer — if the diff got truncated (`focus pr` says so), it hasn't even seen
+the end of it.
 
 A review on a local model takes a minute, so it tells you what it's doing while
 it does it: what context and ticket it found, how much diff it sent, then a live

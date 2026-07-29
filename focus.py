@@ -307,12 +307,29 @@ Reply with ONLY this JSON:
 {"subtasks": [{"text": "...", "estimate_min": 10}]}"""
 
 SYS_PR = """You help a developer with ADHD review a pull request without drowning.
-Given a unified diff, reply with ONLY this JSON:
+You are given a unified diff. What a reviewer needs first is what is WRONG with it:
+findings first, chores second.
+Rules:
+- findings are concrete problems you can point at in this diff. Each one names the
+  file, quotes the line or symbol it is about, and says in one sentence what breaks
+  and when it bites. Worst first.
+- Zero findings is a respectable answer. Say nothing rather than padding with
+  "consider adding tests" or "make sure this is correct".
+- severity is exactly one of: "bug" (wrong behaviour), "risk" (works today, will
+  bite later), "nit" (naming, style, dead code).
+- Never comment on code that is not in the diff. Never invent a file or a line.
+- checklist is only what a human has to check by running the code or reading AROUND
+  the diff — the things you cannot verify from the diff alone. One or two per
+  changed file, ordered so related files sit together. Do not pad.
+- Inside "summary", "what" and "item", write markdown: `backticks` around
+  identifiers, paths and values. No headings, no bullets, no code fences.
+- "file" and "where" are plain text — no backticks, no markdown. They get quoted
+  for you.
+Reply with ONLY this JSON:
 {"summary": "3 short sentences max: what this change does and why",
- "risks": ["the 1-4 places a reviewer should look hardest, most important first"],
- "checklist": [{"file": "path", "item": "one specific thing to verify in this file"}]}
-Checklist rules: one or two items per changed file, concrete and verifiable,
-ordered so related files sit together. Do not pad. Do not invent files."""
+ "findings": [{"severity": "bug", "file": "path", "where": "the line or symbol",
+               "what": "what is wrong, and when it bites"}],
+ "checklist": [{"file": "path", "item": "one specific thing to verify in this file"}]}"""
 
 SYS_DRAFT = """You help a developer with ADHD write work messages. They will give you
 rough bullets or a half-written draft. Produce a ready-to-send message.
@@ -1768,7 +1785,7 @@ def run_pr_review(diff, source, name=None, project=None, no_project=False,
         "source": source,
         "created": now_iso(),
         "summary": data.get("summary", ""),
-        "risks": data.get("risks", []),
+        "findings": session_findings(data),
         "truncated": truncated,
         "project": {"source": ctx_source, "chars": len(ctx)} if ctx else None,
         "pr": {"number": pr_meta["number"], "title": pr_meta.get("title", ""),
@@ -1878,7 +1895,7 @@ def cmd_pr(args):
                             story=args.story, no_ticket=args.no_ticket,
                             progress=pr_progress_printer())
     print_pr(session)
-    print(f"Saved as '{session['name']}'. After any interruption: focus pr resume")
+    print(f"\nSaved as '{session['name']}'. After any interruption: focus pr resume")
 
 def _latest_session_path():
     """Newest session file in pr/, or None (dir missing or empty)."""
@@ -1898,41 +1915,85 @@ def latest_session():
         raise SystemExit("No PR sessions yet. Run `focus pr` on a diff first.")
     return path
 
-def print_pr(s):
-    print(f"\nPR REVIEW: {s['name']}  (from {s['source']})")
-    if s.get("pr"):
-        pr = s["pr"]
-        draft = " [draft]" if pr.get("draft") else ""
-        print(f"  #{pr['number']} {pr['title']}{draft}")
-        if pr.get("url"):
-            print(f"  {pr['url']}")
+SEVERITIES = ("bug", "risk", "nit")
+MAX_WHERE_CHARS = 90
+
+def session_findings(d):
+    """Findings out of a model reply or a saved session. Sessions written before
+    findings existed carry `risks` — a list of bare strings — and there is no migration
+    layer, so the reader converts rather than the file changing under someone."""
+    out = []
+    for f in d.get("findings") or []:
+        if isinstance(f, str) and f.strip():
+            out.append({"severity": "risk", "file": "", "where": "", "what": f.strip()})
+        elif isinstance(f, dict) and (f.get("what") or f.get("where")):
+            sev = str(f.get("severity") or "").strip().lower()
+            # file/where are asked for bare and quoted by the renderer. Models quote them
+            # anyway — telling one not to use markdown in two fields out of five never
+            # sticks — so strip it here rather than printing ``sleep(1)``.
+            out.append({"severity": sev if sev in SEVERITIES else "risk",
+                        "file": str(f.get("file") or "").strip().strip("`"),
+                        "where": _clip(str(f.get("where") or "").strip().strip("`"),
+                                       MAX_WHERE_CHARS),
+                        "what": str(f.get("what") or "")})
+    if out:
+        return out
+    return [{"severity": "risk", "file": "", "where": "", "what": r.strip()}
+            for r in d.get("risks") or [] if isinstance(r, str) and r.strip()]
+
+def pr_markdown(s):
+    """The review as markdown — the one renderer there is. `focus pr` prints it and the
+    dashboard's copy button asks for it, so what you read in the terminal is exactly what
+    lands in the PR comment. Terminal-first: no tables, no reference links, nothing that
+    only makes sense once something else renders it."""
+    out = [f"## PR review — {s['name']}"]
+    meta = [f"from {s['source']}"]
     if s.get("project"):
-        print(f"  project context: {s['project']['source']} "
-              f"({s['project']['chars']} chars)")
+        meta.append(f"project context: {s['project']['source']} "
+                    f"({s['project']['chars']} chars)")
     if s.get("ticket"):
         t = s["ticket"]
-        print(f"  ticket: sc-{t['id']} {t.get('name', '')} "
-              f"(via {t.get('how', '?')}, {t['chars']} chars)")
-    print("-" * 56)
-    print("WHAT IT DOES:\n" + textwrap.fill(s["summary"], 72, initial_indent="  ",
-                                            subsequent_indent="  "))
+        meta.append(f"ticket: sc-{t['id']} {t.get('name', '')} "
+                    f"(via {t.get('how', '?')}, {t['chars']} chars)".replace("  ", " "))
+    out.append("*" + " · ".join(meta) + "*")
+    if s.get("pr"):
+        pr = s["pr"]
+        title = f"#{pr['number']} {pr['title']}".strip()
+        out.append(("**[draft]** " if pr.get("draft") else "")
+                   + (f"[{title}]({pr['url']})" if pr.get("url") else title))
+    out += ["", "### What it does", textwrap.fill(s.get("summary", ""), 78)]
     if s.get("truncated"):
-        print("\n  !! Diff was truncated — large PR. Review the tail manually.")
-    if s["risks"]:
-        print("\nLOOK HARDEST AT:")
-        for r in s["risks"]:
-            print("  ! " + r)
-    print("\nCHECKLIST (tick with `focus pr check N`):")
+        out += ["", "> **Diff was truncated** — large PR. Review the tail manually."]
+    findings = session_findings(s)
+    out += ["", "### Findings"]
+    if not findings:
+        out.append("Nothing flagged. Read it yourself anyway — a small local model is "
+                   "not a reviewer, it is a first pass.")
+    for f in findings:
+        head = f"**{f['severity']}**"
+        if f["file"]:
+            head += f" `{f['file']}`"
+        if f["where"]:
+            head += f" — `{f['where']}`"
+        out.append(f"- {head}")
+        if f["what"]:
+            out.append(textwrap.fill(f["what"], 78, initial_indent="  ",
+                                     subsequent_indent="  "))
+    done = sum(1 for c in s["checklist"] if c["done"])
+    out += ["", f"### Checklist — {done}/{len(s['checklist'])} done",
+            "Tick with `focus pr check N`.", ""]
     undone_seen = False
     for i, c in enumerate(s["checklist"], 1):
-        tick = "x" if c["done"] else " "
         marker = ""
         if not c["done"] and not undone_seen:
             marker = "   <- you are here"
             undone_seen = True
-        print(f"  [{tick}] {i}. {c['file']}: {c['item']}{marker}")
-    done = sum(1 for c in s["checklist"] if c["done"])
-    print(f"\n  {done}/{len(s['checklist'])} done.")
+        out.append(f"- [{'x' if c['done'] else ' '}] {i}. `{c['file']}` — "
+                   f"{c['item']}{marker}")
+    return "\n".join(out)
+
+def print_pr(s):
+    print("\n" + pr_markdown(s))
 
 def cmd_pr_resume(args, item=None):
     path = pr_session_path(args.name) if args.name else latest_session()
@@ -2795,7 +2856,7 @@ class UIHandler(BaseHTTPRequestHandler):
                         # has to stop saying a review is running.
                         pr_progress_end()
                     return self._send(200, session)
-                if action not in ("resume", "check"):
+                if action not in ("resume", "check", "markdown"):
                     return self._send(400, {"error": "bad action"})
                 path = (pr_session_path(body["name"]) if body.get("name")
                         else _latest_session_path())
@@ -2805,6 +2866,11 @@ class UIHandler(BaseHTTPRequestHandler):
                 if s is None:
                     return self._send(404, {"error":
                         "No PR sessions yet. Run a review first."})
+                if action == "markdown":
+                    # The same text `focus pr` prints, so what the copy button puts on
+                    # the clipboard is the review, not a second rendering of it.
+                    return self._send(200, {"name": s["name"],
+                                            "markdown": pr_markdown(s)})
                 if action == "check":
                     idx = int(body.get("n", 0)) - 1
                     if not (0 <= idx < len(s["checklist"])):
@@ -2923,7 +2989,14 @@ details.panel summary .muted{font-weight:400;}
 details.sub{margin-top:10px;}
 details.sub summary{cursor:pointer;font-size:.88rem;font-weight:600;color:var(--accent);}
 details.sub>*{margin-top:8px;}
-.facts li,.risks li{margin:2px 0 2px 18px;font-size:.9rem;}
+.facts li,.risks li,.findings li{margin:2px 0 2px 18px;font-size:.9rem;}
+.findings li{margin-bottom:6px;}
+.findings code{font-size:.82rem;opacity:.85;}
+.sev{font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.04em;
+  border-radius:4px;padding:1px 5px;margin-right:6px;}
+.sev-bug{background:var(--red);color:#fff;}
+.sev-risk{background:var(--amber);color:#fff;}
+.sev-nit{background:#6f6f6f;color:#fff;}
 .check label{display:flex;gap:7px;font-size:.9rem;padding:2px 0;align-items:flex-start;cursor:pointer;}
 .check .done{opacity:.55;text-decoration:line-through;}
 .here{color:var(--green);font-weight:700;}
@@ -3357,12 +3430,26 @@ function renderPr(sn){
   if(sn.truncated){const w=document.createElement("div");w.className="warn";
     w.textContent="!! Diff was truncated — large PR. Review the tail manually.";
     o.appendChild(w);}
-  if((sn.risks||[]).length){
-    const h=document.createElement("div");h.className="muted";
-    h.style.marginTop="6px";h.textContent="Look hardest at:";o.appendChild(h);
-    const ul=document.createElement("ul");ul.className="risks";
-    for(const r of sn.risks){const li=document.createElement("li");
-      li.textContent=r;ul.appendChild(li);}
+  // sessions written before findings existed carry `risks`, a list of bare strings
+  const fs=(sn.findings||[]).map(f=>typeof f==="string"
+    ?{severity:"risk",file:"",where:"",what:f}:f)
+    .concat((sn.findings||[]).length?[]:(sn.risks||[])
+      .map(r=>({severity:"risk",file:"",where:"",what:r})));
+  const h=document.createElement("div");h.className="muted";
+  h.style.marginTop="6px";h.textContent=fs.length?"Findings:":"Nothing flagged.";
+  o.appendChild(h);
+  if(fs.length){
+    const ul=document.createElement("ul");ul.className="findings";
+    for(const f of fs){
+      const li=document.createElement("li");
+      const s2=document.createElement("span");s2.className="sev sev-"+(f.severity||"risk");
+      s2.textContent=f.severity||"risk";li.appendChild(s2);
+      const where=[f.file,f.where].filter(Boolean).join(" · ");
+      if(where){const c=document.createElement("code");c.textContent=where;
+        li.appendChild(c);li.appendChild(document.createTextNode(" "));}
+      li.appendChild(document.createTextNode(f.what||""));
+      ul.appendChild(li);
+    }
     o.appendChild(ul);
   }
   const chk=document.createElement("div");chk.className="check";
@@ -3384,7 +3471,22 @@ function renderPr(sn){
   const done=sn.checklist.filter(c=>c.done).length;
   const prog=document.createElement("div");prog.className="muted";
   prog.textContent=done+"/"+sn.checklist.length+" done";
+  addBtn(prog,"copy as markdown",copyPrMarkdown);
   o.appendChild(prog);
+}
+// The server renders it, so the clipboard gets exactly what `focus pr` prints. If the
+// browser refuses the clipboard, show the text instead of swallowing it.
+async function copyPrMarkdown(){
+  const s=document.getElementById("prStatus");
+  try{
+    const r=await api("/api/pr",{action:"markdown",name:prName});
+    try{await navigator.clipboard.writeText(r.markdown);s.textContent="copied";}
+    catch(e){
+      const pre=document.createElement("pre");pre.className="out";
+      pre.textContent=r.markdown;document.getElementById("prOut").appendChild(pre);
+      s.textContent="couldn't reach the clipboard — select it below";
+    }
+  }catch(e){s.textContent=e.message;}
 }
 // --- voice
 async function loadVoice(){
