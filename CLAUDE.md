@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-python3 tests/test_focus.py           # the whole test suite (~295 checks, no pytest)
+python3 tests/test_focus.py           # the whole test suite (~303 checks, no pytest)
 uv tool install --editable .          # install `focus` on PATH, running this folder live
 uv run --script focus.py <subcommand> # run without installing (PEP 723 header, zero deps)
 focus doctor                          # check which local model server is reachable
@@ -244,6 +244,15 @@ bare, and models ignore that, so the renderer would print ` ``sleep(1)`` `.
 
 Every finding carries a `fix` (the edit to make, not the goal), and non-defects go in a
 separate top-level `suggestions` list so they can't dilute the findings.
+
+**Silence is a valid review.** All three PR prompts say outright that an empty findings
+list, empty checklist and no suggestions is a complete answer, and the checklist rule
+carries "there is no quota" — it used to say *one or two per changed file*, which is a
+quota, and a quota gets filled. Don't reintroduce a per-file minimum anywhere. The
+renderers hold up their end: `pr_markdown` omits the whole `### Checklist` section when
+there is nothing to check (an empty one reads as a form the model failed to fill in), the
+dashboard says `nothing to chase — no checklist` instead of `0/0 done`, and
+`run_pr_review` drops checklist items whose `item` is blank.
 
 **The author's to-do list is not review material.** `_strip_todos()` drops unticked
 checkbox lines from the PR description before `_pr_preamble` puts it in front of the diff,

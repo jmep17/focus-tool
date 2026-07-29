@@ -316,12 +316,18 @@ How to read the diff, before anything else:
 - Before you write a finding, re-read the "+" lines: if they already do the thing you
   were about to ask for, there is no finding. Recommending a fix that is already in
   the diff is the single worst thing you can do here.
+You are not required to say anything. If the change is fine, the right review is an
+empty findings list, an empty checklist and no suggestions. Nobody is grading you on
+how much you wrote, and a made-up observation costs the reader more than silence
+saves them. Never comment because a section exists.
 Rules:
 - findings are concrete problems you can point at in this diff. Each one names the
   file, quotes the line or symbol it is about, and says in one sentence what breaks
   and when it bites. Worst first.
 - Zero findings is a respectable answer. Say nothing rather than padding with
   "consider adding tests" or "make sure this is correct".
+- Only report a "nit" if you would actually mention it to the author face to face.
+  Trivia you would let slide in person, let slide here.
 - severity is exactly one of: "bug" (wrong behaviour), "risk" (works today, will
   bite later), "nit" (naming, style, dead code).
 - Never comment on code that is not in the diff. Never invent a file or a line.
@@ -331,10 +337,12 @@ Rules:
   when you genuinely cannot suggest one.
 - suggestions: improvements that are NOT defects — a simpler shape, a name that
   would carry better, a test worth having. Nothing that duplicates a finding. Zero
-  is fine.
+  is the normal answer; only speak up when it would genuinely be better.
 - checklist is only what a human has to check by running the code or reading AROUND
-  the diff — the things you cannot verify from the diff alone. One or two per
-  changed file, ordered so related files sit together. Do not pad.
+  the diff — the things you cannot verify from the diff alone. There is no quota:
+  a file that needs nothing checked gets nothing, and an empty checklist is a fine
+  outcome. Never add an item per file for symmetry. Order so related files sit
+  together.
 - If the author's description contains a task list, a TODO list or unticked boxes,
   those are THEIR notes to themselves. Never copy them into the checklist, the
   findings or the suggestions. Review the code, not the author's to-do list.
@@ -372,12 +380,15 @@ Rules:
   surrounding code's conventions say should have been done differently.
 - severity is exactly one of: "bug" (wrong behaviour), "risk" (works today, will
   bite later), "nit" (naming, style, dead code).
-- Zero findings is a respectable answer for a clean file. Never pad.
+- A clean file gets `{"findings": [], "checklist": []}` and that is a complete,
+  correct answer. Reading closely is the job; commenting is not. Do not reach for
+  something to say because the file was assigned to you, and only report a "nit" if
+  you would mention it to the author face to face.
 - Never comment on code that is not in this diff. Never invent a line.
 - If the author's description contains a task list or unticked boxes, ignore it
   entirely — it is their notes, not your review.
 - checklist: at most 2 things a human must check by running the code or reading
-  around this diff. Often zero.
+  around this diff. Usually zero.
 - markdown `backticks` inside "what", "fix" and "item"; "where" stays plain.
 Reply with ONLY this JSON:
 {"findings": [{"severity": "bug", "file": "path", "where": "the line or symbol",
@@ -391,8 +402,9 @@ passes. Write the overview a reviewer reads first.
 Rules:
 - summary: 3 short sentences max — what this change does and why, across all files.
 - suggestions: improvements that are NOT defects and do not repeat a finding —
-  a simpler shape, a better name, a test worth having. Zero is fine. Never copy
-  anything out of the author's own task list or TODOs.
+  a simpler shape, a better name, a test worth having. Zero is the normal answer;
+  an empty list is a fine review of a good change, so never invent one to fill the
+  section. Never copy anything out of the author's own task list or TODOs.
 - Do not restate the findings. Do not invent new ones.
 - markdown `backticks` around identifiers and paths.
 Reply with ONLY this JSON:
@@ -1994,7 +2006,7 @@ def run_pr_review(diff, source, name=None, project=None, no_project=False,
         "ticket": dict(ticket_info, chars=len(ticket)) if ticket_info else None,
         "checklist": [
             {"file": c.get("file", "?"), "item": c.get("item", ""), "done": False}
-            for c in data.get("checklist", [])
+            for c in data.get("checklist", []) if (c.get("item") or "").strip()
         ],
     }
     save_json(pr_session_path(name), session)
@@ -2176,8 +2188,8 @@ def pr_markdown(s):
     findings = session_findings(s)
     out += ["", "### Findings"]
     if not findings:
-        out.append("Nothing flagged. Read it yourself anyway — a small local model is "
-                   "not a reviewer, it is a first pass.")
+        out.append("Nothing flagged — this looks fine. (A first pass on a local model, "
+                   "not a reviewer.)")
     for f in findings:
         head = f"**{f['severity']}**"
         if f["file"]:
@@ -2200,17 +2212,20 @@ def pr_markdown(s):
         out += ["", "> Not reviewed (past the "
                 f"{MAX_DEEP_FILES}-file deep-review cap): "
                 + ", ".join(f"`{p}`" for p in s["deep"]["skipped"])]
-    done = sum(1 for c in s["checklist"] if c["done"])
-    out += ["", f"### Checklist — {done}/{len(s['checklist'])} done",
-            "Tick with `focus pr check N`.", ""]
-    undone_seen = False
-    for i, c in enumerate(s["checklist"], 1):
-        marker = ""
-        if not c["done"] and not undone_seen:
-            marker = "   <- you are here"
-            undone_seen = True
-        out.append(f"- [{'x' if c['done'] else ' '}] {i}. `{c['file']}` — "
-                   f"{c['item']}{marker}")
+    # No checklist section at all when there is nothing to check. An empty one reads as a
+    # form the model failed to fill in, when what it means is "nothing to chase here".
+    if s["checklist"]:
+        done = sum(1 for c in s["checklist"] if c["done"])
+        out += ["", f"### Checklist — {done}/{len(s['checklist'])} done",
+                "Tick with `focus pr check N`.", ""]
+        undone_seen = False
+        for i, c in enumerate(s["checklist"], 1):
+            marker = ""
+            if not c["done"] and not undone_seen:
+                marker = "   <- you are here"
+                undone_seen = True
+            out.append(f"- [{'x' if c['done'] else ' '}] {i}. `{c['file']}` — "
+                       f"{c['item']}{marker}")
     return "\n".join(out)
 
 def print_pr(s):
@@ -3705,7 +3720,8 @@ function renderPr(sn){
     .concat((sn.findings||[]).length?[]:(sn.risks||[])
       .map(r=>({severity:"risk",file:"",where:"",what:r})));
   const h=document.createElement("div");h.className="muted";
-  h.style.marginTop="6px";h.textContent=fs.length?"Findings:":"Nothing flagged.";
+  h.style.marginTop="6px";
+  h.textContent=fs.length?"Findings:":"Nothing flagged — this looks fine.";
   o.appendChild(h);
   if(fs.length){
     const ul=document.createElement("ul");ul.className="findings";
@@ -3739,6 +3755,14 @@ function renderPr(sn){
     w.textContent="Not reviewed (past the file cap): "+sn.deep.skipped.join(", ");
     o.appendChild(w);
   }
+  const prog=document.createElement("div");prog.className="muted";
+  if(!sn.checklist.length){
+    // no empty checklist and no "0/0 done" — that reads as a form left half-filled
+    prog.textContent="nothing to chase — no checklist";
+    addBtn(prog,"copy as markdown",copyPrMarkdown);
+    o.appendChild(prog);
+    return;
+  }
   const chk=document.createElement("div");chk.className="check";
   chk.style.marginTop="8px";
   let here=false;
@@ -3759,7 +3783,6 @@ function renderPr(sn){
   });
   o.appendChild(chk);
   const done=sn.checklist.filter(c=>c.done).length;
-  const prog=document.createElement("div");prog.className="muted";
   prog.textContent=done+"/"+sn.checklist.length+" done";
   addBtn(prog,"copy as markdown",copyPrMarkdown);
   o.appendChild(prog);

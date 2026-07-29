@@ -158,6 +158,32 @@ check("a pre-findings session still renders",
 check("nothing flagged says so, and says why to read it anyway",
       "Nothing flagged" in focus.pr_markdown(dict(old_session, risks=[])))
 
+# --- a clean diff is allowed to produce nothing at all
+check("the prompt says silence is a complete answer",
+      "You are not required to say anything" in focus.SYS_PR
+      and "There is no quota" in focus.SYS_PR)
+check("the per-file prompt says the same",
+      "Reading closely is the job; commenting is not." in focus.SYS_PR_FILE)
+check("nothing is padded to fill a section",
+      "Zero is the normal answer;" in focus.SYS_PR_SUMMARY)
+clean = focus.pr_markdown({"name": "clean", "source": "git diff HEAD",
+                           "summary": "Renames a variable.", "findings": [],
+                           "suggestions": [], "checklist": []})
+check("a clean review says it is fine", "Nothing flagged — this looks fine" in clean, clean)
+check("a clean review has no empty checklist to stare at",
+      "### Checklist" not in clean and "0/0" not in clean
+      and "you are here" not in clean, clean)
+clean_path = os.path.join(TMP, "clean.diff")
+with open(clean_path, "w") as f:
+    f.write("--- a/pay.py\n+++ b/pay.py\n@@ -1 +1 @@\n-x = 1  # CLEAN-DIFF\n+total = 1\n")
+code, clean_out = run(["pr", "-f", clean_path, "--name", "clean-pr"])
+check("a clean review runs to completion",
+      code == 0 and "Nothing flagged" in clean_out, clean_out)
+check("a clean review prints no checklist section",
+      "### Checklist" not in clean_out, clean_out)
+check("a blank checklist item is dropped, not stored",
+      focus.load_json(focus.pr_session_path("clean-pr"), None)["checklist"] == [])
+
 # --- every finding carries the fix, and non-defects land in their own section
 check("findings carry a recommended fix", "**Fix:** Pass `idempotency_key=key`" in out, out)
 check("suggestions get their own section",

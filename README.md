@@ -134,7 +134,10 @@ You get **findings first**: concrete problems quoted out of the diff, each tagge
 `bug` / `risk` / `nit`, worst first, **each with the fix it would make** — then a
 3-sentence summary, any suggestions that aren't defects, then a checklist of the
 things only a human can check by running the code.
-Zero findings is an allowed answer; the prompt would rather say nothing than pad.
+Zero findings is an allowed answer, and so is zero of everything else: if the
+change is fine you get "Nothing flagged — this looks fine" and no checklist to
+stare at. There's no per-file quota anywhere in the prompts, because a quota just
+gets filled with things nobody needed to read.
 Your own PR description is context, never review material: unticked checkboxes are
 stripped out of it, so a review never hands you back your own to-do list.
 Your position in the checklist is saved on disk, so a meeting or a Slack ping

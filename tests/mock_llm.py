@@ -56,6 +56,12 @@ def canned_reply(messages):
             "suggestions": ["Pull the backoff into `retry_delay()` so it can be tested"],
         })
     if "unified diff" in system:
+        # a clean diff: nothing found, nothing to check, and one blank item to prove the
+        # consumer drops it rather than printing an empty checklist row
+        if "CLEAN-DIFF" in messages[-1]["content"]:
+            return json.dumps({"summary": "Renames a local variable.", "findings": [],
+                               "suggestions": [],
+                               "checklist": [{"file": "pay.py", "item": "   "}]})
         return json.dumps({
             "summary": "Adds retry logic to the payment client and covers it with tests.",
             "suggestions": ["Consider a shared `retry_delay()` helper"],
