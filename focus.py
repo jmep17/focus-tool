@@ -54,6 +54,7 @@ def focus_home():
     os.makedirs(home, exist_ok=True)
     os.makedirs(os.path.join(home, "pr"), exist_ok=True)
     os.makedirs(os.path.join(home, "projects"), exist_ok=True)
+    os.makedirs(os.path.join(home, "memory"), exist_ok=True)
     return home
 
 def _path(name):
@@ -356,12 +357,38 @@ def _remote_ident(root):
 
 _ROOT_CACHE = {}
 
+# Which repo everything root-derived resolves against. Only the UI's picker sets it —
+# the CLI leaves it None and stays cwd-based, so no command changes behaviour. One
+# value for the whole dashboard, not per-request: there is one active repo at a time.
+_ACTIVE_ROOT = None
+
+def active_root():
+    return _ACTIVE_ROOT or os.getcwd()
+
+def set_active_root(path):
+    """Point every root-derived lookup at `path`, and return the repo root it resolved
+    to. Raises ValueError if it isn't a readable directory."""
+    global _ACTIVE_ROOT
+    path = os.path.abspath(os.path.expanduser(path or ""))
+    if not os.path.isdir(path):
+        raise ValueError(f"Not a folder: {path}")
+    # A subdirectory of a repo selects the repo, the same way the cwd path does.
+    root = _git(["rev-parse", "--show-toplevel"], cwd=path).strip() or path
+    _ROOT_CACHE.pop(root, None)   # re-selecting re-probes: a remote may have been added
+    _ACTIVE_ROOT = root
+    return root
+
+def is_git_repo(path):
+    """Cheap enough for a directory listing — a stat, not a shell-out. `exists` rather
+    than `isdir` because a linked worktree's .git is a file."""
+    return os.path.exists(os.path.join(path, ".git"))
+
 def _root_and_key():
-    """(repo root, storage key) for the cwd. Cached — this shells out to git twice,
-    and api_state() is polled every few seconds by the dashboard."""
-    cwd = os.getcwd()
+    """(repo root, storage key) for the active repo. Cached — this shells out to git
+    twice, and api_state() is polled every few seconds by the dashboard."""
+    cwd = active_root()
     if cwd not in _ROOT_CACHE:
-        root = _git(["rev-parse", "--show-toplevel"]).strip() or cwd
+        root = _git(["rev-parse", "--show-toplevel"], cwd=cwd).strip() or cwd
         ident = _remote_ident(root) or os.path.basename(root.rstrip(os.sep))
         _ROOT_CACHE[cwd] = (root, safe_name(ident))
     return _ROOT_CACHE[cwd]
@@ -384,6 +411,25 @@ def save_project(key, p):
 def list_projects():
     d = os.path.join(focus_home(), "projects")
     return sorted(f[:-5] for f in os.listdir(d) if f.endswith(".json"))
+
+# ---- the dashboard's repo selection, remembered between runs
+
+MAX_RECENT_REPOS = 8
+
+def load_ui_prefs():
+    return load_json(_path("ui.json"), {})
+
+def save_ui_prefs(p):
+    save_json(_path("ui.json"), p)
+
+def remember_repo(root):
+    """Push `root` to the front of the recent list and persist it as the selection."""
+    p = load_ui_prefs()
+    recent = [r for r in p.get("recent", []) if r != root]
+    p["repo"] = root
+    p["recent"] = [root] + recent[:MAX_RECENT_REPOS - 1]
+    save_ui_prefs(p)
+    return p
 
 # ---- turning a diff (or any text) into what to look for
 
@@ -608,11 +654,20 @@ def load_history():
         pass
     return out
 
-def load_memory():
-    return load_json(_path("memory.json"), {})
+def memory_path(key=None):
+    """Global memory, or one repo's. Same file shape either way — {facts[], disabled?} —
+    so the two scopes share every reader and writer below."""
+    return (os.path.join(focus_home(), "memory", key + ".json") if key
+            else _path("memory.json"))
 
-def save_memory(m):
-    save_json(_path("memory.json"), m)
+def load_memory(key=None):
+    return load_json(memory_path(key), {})
+
+def save_memory(m, key=None):
+    save_json(memory_path(key), m)
+
+def memory_facts(m):
+    return [f["text"] for f in m.get("facts", []) if f.get("text")]
 
 def _estimate_ratio(hist):
     """Median actual/estimate across finished tasks; None until 3 samples exist."""
@@ -657,19 +712,32 @@ MEMORY_HEADER = ("\nUSER MEMORY — this user's real patterns and standing facts
                  "them to size estimates and shape advice:\n")
 MAX_MEMORY_CHARS = 600   # small on purpose: local context is scarce and shared
 
-def memory_system_suffix(disabled=False):
-    """Stats derived from history plus explicit `focus memory` facts, as a system-prompt
-    suffix. Same contract as voice_system_suffix: "" when off or empty."""
+def _memory_lines(m):
+    return ["- " + x for x in memory_facts(m)] if not m.get("disabled") else []
+
+def memory_system_suffix(disabled=False, no_project=False):
+    """Stats derived from history, explicit global facts, and this repo's own facts, as
+    one system-prompt suffix. Same contract as voice_system_suffix: "" when off or empty.
+
+    Stats stay global: history.jsonl carries no repo, and how far a person's estimates
+    run out is a fact about the person. `no_project` drops the repo block for the same
+    reason --no-project drops the repo profile — one flag, one meaning.
+    """
     if disabled:
         return ""
-    m = load_memory()
-    if m.get("disabled"):
-        return ""
-    facts = [f["text"] for f in m.get("facts", []) if f.get("text")]
-    body = "\n".join("- " + x for x in memory_stats_lines() + facts)
-    if not body:
-        return ""
-    return MEMORY_HEADER + _clip(body, MAX_MEMORY_CHARS)
+    glob = load_memory()
+    lines = ([] if glob.get("disabled") else ["- " + x for x in memory_stats_lines()]) \
+        + _memory_lines(glob)
+    proj_lines = [] if no_project else _memory_lines(load_memory(project_key()))
+    proj = ""
+    if proj_lines:
+        proj = "\n".join([f"In this project ({project_key()}):"] + proj_lines)
+        # Repo facts are the specific ones — clip them first, and cap them at half, so a
+        # long global list can neither crowd them out nor be crowded out by them.
+        proj = _clip(proj, MAX_MEMORY_CHARS // 2)
+    body = _clip("\n".join(lines), MAX_MEMORY_CHARS - len(proj) - bool(proj))
+    body = "\n".join(x for x in (body, proj) if x)
+    return MEMORY_HEADER + body if body else ""
 
 DRAFT_STYLES = {
     "slack": "Format: a Slack message. Casual-professional. No greeting needed unless addressing someone new.",
@@ -835,7 +903,7 @@ def cmd_dump(args):
     try:
         system = SYS_DUMP + project_system_suffix(text, BRIEF_CONTEXT_CHARS,
                                                   disabled=args.no_project) \
-            + memory_system_suffix(args.no_memory)
+            + memory_system_suffix(args.no_memory, args.no_project)
         data = ask_model(system, text)
         for item in data.get("tasks", []):
             if not item.get("title"):
@@ -891,7 +959,7 @@ def cmd_break(args):
         context += "\nExtra context: " + " ".join(args.hint)
     system = SYS_BREAK + project_system_suffix(context, BRIEF_CONTEXT_CHARS,
                                                disabled=args.no_project) \
-        + memory_system_suffix(args.no_memory)
+        + memory_system_suffix(args.no_memory, args.no_project)
     data = ask_model(system, context)
     subs = data.get("subtasks", [])
     if not subs:
@@ -1121,43 +1189,62 @@ def cmd_timer(args):
 
 # ------------------------------------------------ memory
 
+def _memory_scope(args):
+    """Which memory the verb acts on: None for global, else a project key. `--here` is
+    spelled as a flag rather than an optional-value `--project` because
+    `memory add --project "a fact"` would silently eat the fact as the flag's value."""
+    if getattr(args, "project", None):
+        return project_key(args.project)
+    return project_key() if getattr(args, "here", False) else None
+
 def cmd_memory(args):
-    m = load_memory()
+    key = _memory_scope(args)
+    m = load_memory(key)
     if args.action == "show":
         stats = memory_stats_lines()
-        facts = [f["text"] for f in m.get("facts", []) if f.get("text")]
-        if not stats and not facts:
+        facts = memory_facts(m)
+        proj = load_memory(project_key()) if key is None else {}
+        proj_facts = memory_facts(proj)
+        if not stats and not facts and not proj_facts:
             print("Nothing remembered yet. `focus memory add <a fact about you>` —")
             print("estimate patterns appear on their own as you finish tasks.")
             return
         state = "OFF — not being injected" if m.get("disabled") else \
             "used by dump / break / draft"
-        print(f"\nUSER MEMORY ({state}):\n")
-        for line in stats:
-            print(f"  - {line}   (derived from history)")
+        scope = f"project {key}" if key else "about you, everywhere"
+        print(f"\nUSER MEMORY — {scope} ({state}):\n")
+        if key is None:
+            for line in stats:
+                print(f"  - {line}   (derived from history)")
         for line in facts:
             print(f"  - {line}")
-        print("\n  add: focus memory add <fact> · edit: focus memory edit · "
-              "off: focus memory off")
+        if proj_facts:
+            off = " — OFF" if proj.get("disabled") else ""
+            print(f"\n  In this project ({project_key()}{off}):\n")
+            for line in proj_facts:
+                print(f"  - {line}")
+        print("\n  add: focus memory add <fact> · this repo only: <fact> --here · "
+              "edit: focus memory edit · off: focus memory off")
         return
     if args.action == "off":
         m["disabled"] = True
-        save_memory(m)
-        print("Memory injection off (facts kept). `focus memory add` re-enables it,")
-        print("or `--no-memory` skips it for a single command.")
+        save_memory(m, key)
+        where = f"for {key} " if key else ""
+        print(f"Memory injection {where}off (facts kept). `focus memory add` re-enables")
+        print("it, or `--no-memory` skips it for a single command.")
         return
     if args.action == "edit":
-        facts = [f["text"] for f in m.get("facts", []) if f.get("text")]
         editor = os.environ.get("EDITOR", "nano")
-        path = _path("memory_facts.txt")
+        # Scoped filename so editing one scope can't clobber the other's buffer.
+        path = _path(f"memory_facts_{key}.txt" if key else "memory_facts.txt")
         with open(path, "w", encoding="utf-8") as f:
-            f.write("\n".join(facts))
+            f.write("\n".join(memory_facts(m)))
         subprocess.run([editor, path])
         with open(path, encoding="utf-8") as f:
             lines = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
         m["facts"] = [{"text": ln, "ts": now_iso()} for ln in lines]
         m["updated"] = now_iso()
-        save_memory(m)
+        save_memory(m, key)
         print(f"Memory updated — {len(lines)} fact(s).")
         return
     # add
@@ -1167,8 +1254,8 @@ def cmd_memory(args):
     m.setdefault("facts", []).append({"text": text.strip(), "ts": now_iso()})
     m.pop("disabled", None)
     m["updated"] = now_iso()
-    save_memory(m)
-    print(f"Remembered: {text.strip()}")
+    save_memory(m, key)
+    print(f"Remembered{' for ' + key if key else ''}: {text.strip()}")
     print("Every dump/break/draft now knows it. `focus memory show` to review.")
 
 # ------------------------------------------------ pr review
@@ -1177,12 +1264,14 @@ def cmd_memory(args):
 # model is already over budget at 60k chars of diff; context must not make that worse.
 MAX_DIFF_CHARS = 60_000
 
-def git_working_diff():
+def git_working_diff(root=None):
     """(diff, source) from staged then unstaged changes, or (None, None). The UI calls
-    this directly — get_diff's stdin tier would block a server thread forever."""
+    this directly — get_diff's stdin tier would block a server thread forever — and
+    passes the picked repo as `root`, so the diff comes from the repo on screen."""
     for cmd in (["git", "diff", "--staged"], ["git", "diff", "HEAD"]):
         try:
-            out = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=15,
+                                 cwd=root)
             if out.returncode == 0 and out.stdout.strip():
                 return out.stdout, " ".join(cmd)
         except (OSError, subprocess.TimeoutExpired):
@@ -1330,7 +1419,7 @@ def cmd_draft(args):
     system = ("\n".join([SYS_DRAFT, style, tone, to])
               + voice_system_suffix(args.no_voice)
               + project_system_suffix(text, BRIEF_CONTEXT_CHARS, disabled=args.no_project)
-              + memory_system_suffix(args.no_memory))
+              + memory_system_suffix(args.no_memory, args.no_project))
     if args.polish:
         user = "Polish this draft, keep my meaning and roughly my voice:\n\n" + text
     else:
@@ -1551,6 +1640,36 @@ def cmd_doctor(args):
 
 # ------------------------------------------------ ui
 
+MAX_BROWSE_DIRS = 200
+
+def repo_state(recent=False):
+    """The active repo, and — only when the picker asks — where it has been. The recent
+    list stays off the 5-second poll; entries that no longer exist are dropped from the
+    view, not from the file, so an unmounted disk comes back."""
+    root, key = _root_and_key()
+    out = {"root": root, "key": key, "git": is_git_repo(root)}
+    if recent:
+        out["recent"] = [{"path": r, "name": os.path.basename(r.rstrip(os.sep)) or r,
+                          "git": is_git_repo(r)}
+                         for r in load_ui_prefs().get("recent", []) if os.path.isdir(r)]
+    return out
+
+def browse_dirs(path):
+    """Subdirectories of `path`, for the repo picker. Raises OSError if unreadable.
+    `git` is a stat rather than a shell-out — this runs once per listed folder."""
+    path = os.path.abspath(os.path.expanduser(path))
+    dirs = []
+    for name in sorted((n for n in os.listdir(path) if not n.startswith(".")),
+                       key=str.lower):
+        p = os.path.join(path, name)
+        if os.path.isdir(p):
+            dirs.append({"name": name, "path": p, "git": is_git_repo(p)})
+        if len(dirs) >= MAX_BROWSE_DIRS:
+            break
+    parent = os.path.dirname(path.rstrip(os.sep))
+    return {"path": path, "git": is_git_repo(path), "dirs": dirs,
+            "parent": parent if parent != path else ""}
+
 def api_state():
     store = load_store()
     nxt = pick_next(store)
@@ -1585,7 +1704,8 @@ def api_state():
             "memory": bool(memory_system_suffix()),
             "done_today": done_today, "done_week": done_week,
             "streak": _streak(_done_dates(hist)), "ratio": _estimate_ratio(hist),
-            "stale_days": STALE_DAYS, "home": focus_home(), "root": project_root()}
+            "stale_days": STALE_DAYS, "home": focus_home(), "root": project_root(),
+            "repo": repo_state()}
 
 class UIHandler(BaseHTTPRequestHandler):
     def log_message(self, *a):
@@ -1682,7 +1802,8 @@ class UIHandler(BaseHTTPRequestHandler):
                 system = SYS_BREAK + project_system_suffix(
                     context, BRIEF_CONTEXT_CHARS,
                     disabled=body.get("no_project", False)) \
-                    + memory_system_suffix(body.get("no_memory", False))
+                    + memory_system_suffix(body.get("no_memory", False),
+                                           body.get("no_project", False))
                 data = ask_model(system, context)
                 t["subtasks"] = [
                     {"text": s["text"], "done": False,
@@ -1699,7 +1820,8 @@ class UIHandler(BaseHTTPRequestHandler):
                     system = SYS_DUMP + project_system_suffix(
                         body["text"], BRIEF_CONTEXT_CHARS,
                         disabled=body.get("no_project", False)) \
-                        + memory_system_suffix(body.get("no_memory", False))
+                        + memory_system_suffix(body.get("no_memory", False),
+                                               body.get("no_project", False))
                     data = ask_model(system, body["text"])
                     for item in data.get("tasks", []):
                         if item.get("title"):
@@ -1725,7 +1847,8 @@ class UIHandler(BaseHTTPRequestHandler):
                     voice_system_suffix(body.get("no_voice", False)) + \
                     project_system_suffix(body["text"], BRIEF_CONTEXT_CHARS,
                                           disabled=body.get("no_project", False)) + \
-                    memory_system_suffix(body.get("no_memory", False))
+                    memory_system_suffix(body.get("no_memory", False),
+                                         body.get("no_project", False))
                 prefix = ("Polish this draft, keep my meaning and roughly my voice:\n\n"
                           if body.get("polish")
                           else "Write the message from these notes:\n\n")
@@ -1773,7 +1896,11 @@ class UIHandler(BaseHTTPRequestHandler):
                 log_event("triage", id=t["id"], decision=decision)
                 self._send(200, {"deleted": t["id"]} if decision == "drop" else t)
             elif self.path == "/api/memory":
-                m = load_memory()
+                # `scope` picks which file a verb writes; the reply always carries both,
+                # so one round-trip renders the whole panel.
+                pkey = project_key()
+                key = pkey if body.get("scope") == "project" else None
+                m = load_memory(key)
                 action = body.get("action", "show")
                 if action == "add":
                     text = (body.get("text") or "").strip()
@@ -1782,22 +1909,26 @@ class UIHandler(BaseHTTPRequestHandler):
                     m.setdefault("facts", []).append({"text": text, "ts": now_iso()})
                     m.pop("disabled", None)
                     m["updated"] = now_iso()
-                    save_memory(m)
+                    save_memory(m, key)
                 elif action == "edit":
                     lines = [ln.strip() for ln in (body.get("text") or "").splitlines()
                              if ln.strip()]
                     m["facts"] = [{"text": ln, "ts": now_iso()} for ln in lines]
                     m["updated"] = now_iso()
-                    save_memory(m)
+                    save_memory(m, key)
                 elif action == "off":
                     m["disabled"] = True
-                    save_memory(m)
+                    save_memory(m, key)
                 elif action != "show":
                     return self._send(400, {"error": "bad action"})
+                glob = load_memory() if key else m
+                proj = m if key else load_memory(pkey)
                 self._send(200, {
                     "stats": memory_stats_lines(),
-                    "facts": [f["text"] for f in m.get("facts", []) if f.get("text")],
-                    "disabled": bool(m.get("disabled"))})
+                    "facts": memory_facts(glob),
+                    "disabled": bool(glob.get("disabled")),
+                    "project": {"key": pkey, "facts": memory_facts(proj),
+                                "disabled": bool(proj.get("disabled"))}})
             elif self.path == "/api/voice":
                 v = load_voice()
                 action = body.get("action", "show")
@@ -1879,6 +2010,25 @@ class UIHandler(BaseHTTPRequestHandler):
                     seed, _ = resolve_project_context(budget=MAX_CONTEXT_CHARS)
                 out["edit_seed"] = seed or PROJECT_SKELETON
                 self._send(200, out)
+            elif self.path == "/api/repo":
+                action = body.get("action", "show")
+                if action == "browse":
+                    start = (body.get("path")
+                             or os.path.dirname(project_root().rstrip(os.sep))
+                             or project_root())
+                    try:
+                        return self._send(200, browse_dirs(start))
+                    except OSError as e:
+                        return self._send(400, {"error":
+                            f"Can't read {start}: {e.strerror or e}"})
+                if action == "use":
+                    try:
+                        remember_repo(set_active_root(body.get("path")))
+                    except ValueError as e:
+                        return self._send(400, {"error": str(e)})
+                elif action != "show":
+                    return self._send(400, {"error": "bad action"})
+                self._send(200, repo_state(recent=True))
             elif self.path == "/api/pr":
                 action = body.get("action", "review")
                 if action == "review":
@@ -1886,7 +2036,7 @@ class UIHandler(BaseHTTPRequestHandler):
                     if diff.strip():
                         source = "ui paste"
                     else:
-                        diff, source = git_working_diff()
+                        diff, source = git_working_diff(project_root())
                         if not diff:
                             return self._send(400, {"error":
                                 "No diff. Paste one, or stage changes in "
@@ -1924,6 +2074,14 @@ class UIHandler(BaseHTTPRequestHandler):
             self._send(500, {"error": f"{type(e).__name__}: {e}"})
 
 def cmd_ui(args):
+    # Reopen on the repo the picker was last pointed at. A deleted or unmounted one
+    # must not stop the dashboard from starting — fall back to the cwd, silently.
+    saved = load_ui_prefs().get("repo")
+    if saved:
+        try:
+            set_active_root(saved)
+        except ValueError:
+            pass
     try:
         server = ThreadingHTTPServer(("127.0.0.1", args.port), UIHandler)
     except OSError as e:
@@ -2020,6 +2178,25 @@ details.sub>*{margin-top:8px;}
 .check .done{opacity:.55;text-decoration:line-through;}
 .here{color:var(--green);font-weight:700;}
 .warn{color:var(--amber);font-weight:600;font-size:.9rem;}
+.repobar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:14px;
+font-size:.9rem;color:var(--soft);}
+.repobar .path{font-weight:700;color:var(--ink);}
+.repobar button{font-size:.78rem;padding:3px 9px;}
+.picker{background:var(--card);border:1px solid var(--border);border-radius:12px;
+padding:12px;margin-bottom:14px;}
+.picker .at{font-weight:700;font-size:.9rem;word-break:break-all;}
+.picker ul{list-style:none;max-height:230px;overflow-y:auto;margin:8px 0;
+border:1px solid var(--border);border-radius:8px;}
+.picker li{display:flex;gap:8px;align-items:center;padding:4px 8px;font-size:.9rem;
+border-bottom:1px solid var(--border);}
+.picker li:last-child{border-bottom:none;}
+.picker li:hover{background:var(--accent-soft);}
+.picker li .name{flex:1;cursor:pointer;text-align:left;font:inherit;border:none;
+background:none;padding:0;color:var(--accent);font-weight:600;}
+.picker li .tag{font-size:.72rem;font-weight:700;color:var(--green);
+background:var(--green-soft);border-radius:999px;padding:1px 8px;}
+.memscope{font-weight:700;font-size:.92rem;margin-top:14px;}
+.memscope:first-child{margin-top:0;}
 </style>
 </head>
 <body>
@@ -2029,6 +2206,13 @@ details.sub>*{margin-top:8px;}
       <input type="checkbox" id="projectUse" checked> using <span id="projectSrc"></span></label>
     <label class="muted" id="memoryWrap" style="display:none;cursor:pointer">
       <input type="checkbox" id="memoryUse" checked> memory</label></h1>
+
+  <div class="repobar">
+    <span>repo</span><span class="path" id="repoPath">…</span>
+    <span class="warn" id="repoWarn"></span>
+    <button id="repoBtn" onclick="togglePicker()">change</button>
+  </div>
+  <div class="picker" id="repoPicker" style="display:none"></div>
 
   <div class="panel" id="donePanel" style="display:none;margin:0 0 18px;">
     <h2>🎉 Done today (<span id="doneCount"></span>)</h2>
@@ -2155,8 +2339,12 @@ async function refresh(){
   document.getElementById("projectWrap").style.display=state.project?"inline":"none";
   document.getElementById("projectSrc").textContent=state.project;
   document.getElementById("memoryWrap").style.display=state.memory?"inline":"none";
+  const repo=state.repo||{};
+  document.getElementById("repoPath").textContent=repo.root||state.root||"?";
+  document.getElementById("repoWarn").textContent=
+    repo.root&&!repo.git?"not a git repo — paste diffs instead":"";
   document.getElementById("prPasteBtn").disabled=!state.llm;
-  document.getElementById("prGitBtn").disabled=!state.llm;
+  document.getElementById("prGitBtn").disabled=!state.llm||!repo.git;
   document.getElementById("prGitBtn").textContent="Review changes in "+(state.root||"repo");
   renderOne();renderBoard();renderDone();renderTriage();renderSettings();
 }
@@ -2468,6 +2656,79 @@ function renderVoice(v){
     el.appendChild(row);
   }
 }
+// --- repo picker: the dashboard follows whichever repo you point it at
+let browsePath=null;
+function togglePicker(){
+  const p=document.getElementById("repoPicker");
+  if(p.style.display==="none"){p.style.display="block";loadRepo();}
+  else p.style.display="none";
+}
+async function loadRepo(){
+  try{
+    const r=await api("/api/repo",{action:"show"});
+    const b=await api("/api/repo",{action:"browse",path:browsePath});
+    renderPicker(r,b);
+  }catch(e){document.getElementById("repoPicker").textContent=e.message;}
+}
+async function browseRepo(path){browsePath=path;await loadRepo();}
+async function useRepo(path){
+  try{
+    await api("/api/repo",{action:"use",path:path});
+    browsePath=null;
+    document.getElementById("repoPicker").style.display="none";
+    await refresh();
+    // both panels describe the repo — reload whichever are open, or they go stale
+    if(document.getElementById("projectPanel").open)loadProject();
+    if(document.getElementById("memoryPanel").open)loadMemory();
+  }catch(e){document.getElementById("repoPicker").textContent=e.message;}
+}
+function renderPicker(r,b){
+  const el=document.getElementById("repoPicker");
+  el.innerHTML="";
+  const at=document.createElement("div");at.className="at";at.textContent=b.path;
+  el.appendChild(at);
+  const ul=document.createElement("ul");
+  if(b.parent){
+    const li=document.createElement("li");
+    const up=document.createElement("button");up.className="name";
+    up.textContent="↑ ..";up.onclick=()=>browseRepo(b.parent);
+    li.appendChild(up);ul.appendChild(li);
+  }
+  for(const d of b.dirs){
+    const li=document.createElement("li");
+    const nm=document.createElement("button");nm.className="name";
+    nm.textContent=d.name;nm.onclick=()=>browseRepo(d.path);
+    li.appendChild(nm);
+    if(d.git){const t=document.createElement("span");t.className="tag";
+      t.textContent="git";li.appendChild(t);}
+    addBtn(li,"Use",()=>useRepo(d.path));
+    ul.appendChild(li);
+  }
+  if(!b.dirs.length){
+    const li=document.createElement("li");li.className="muted";
+    li.textContent="no folders in here";ul.appendChild(li);
+  }
+  el.appendChild(ul);
+  const row=document.createElement("div");row.className="row";
+  const inp=document.createElement("input");inp.type="text";inp.style.flex="1";
+  inp.placeholder="/path/to/a/repo";inp.value=b.path;
+  inp.addEventListener("keydown",e=>{if(e.key==="Enter")useRepo(inp.value);});
+  row.appendChild(inp);
+  addBtn(row,"Use this folder",()=>useRepo(inp.value));
+  addBtn(row,"Open",()=>browseRepo(inp.value));
+  el.appendChild(row);
+  if((r.recent||[]).length){
+    const rec=document.createElement("div");rec.className="row";
+    const lbl=document.createElement("span");lbl.className="muted";
+    lbl.textContent="recent:";rec.appendChild(lbl);
+    for(const x of r.recent){
+      const btn=document.createElement("button");
+      btn.textContent=x.name+(x.path===r.root?" ← here":"");
+      btn.title=x.path;btn.onclick=()=>useRepo(x.path);rec.appendChild(btn);
+    }
+    el.appendChild(rec);
+  }
+}
 // --- memory
 async function loadMemory(){
   try{renderMemory(await api("/api/memory",{action:"show"}));}
@@ -2478,44 +2739,57 @@ async function doMemory(body,confirmMsg){
   try{renderMemory(await api("/api/memory",body));refresh();}
   catch(e){document.getElementById("memorySummary").textContent=e.message;}
 }
-function renderMemory(m){
-  const el=document.getElementById("memoryBody"),
-    s=document.getElementById("memorySummary");
-  s.textContent=m.disabled?"off — facts kept, not injected"
-    :(m.facts.length||m.stats.length?"used by dump / break / draft"
-      :"nothing remembered yet");
-  el.innerHTML="";el.className="";
-  if(m.stats.length||m.facts.length){
+// One block per scope, same controls either side — global facts follow you everywhere,
+// project facts follow the repo bar. Every verb carries its scope back to the server.
+function memorySection(el,title,scope,facts,stats,disabled){
+  const h=document.createElement("div");h.className="memscope";
+  h.textContent=title+(disabled?"  — off, facts kept":"");
+  el.appendChild(h);
+  if(stats.length||facts.length){
     const ul=document.createElement("ul");ul.className="facts";
-    for(const x of m.stats){const li=document.createElement("li");
+    for(const x of stats){const li=document.createElement("li");
       li.className="muted";li.textContent=x+"  (derived from history)";
       ul.appendChild(li);}
-    for(const x of m.facts){const li=document.createElement("li");
+    for(const x of facts){const li=document.createElement("li");
       li.textContent=x;ul.appendChild(li);}
     el.appendChild(ul);
   }else{
     const p=document.createElement("div");p.className="muted";
-    p.textContent="Nothing remembered yet — estimate patterns appear on their own as you finish tasks.";
+    p.textContent=scope==="project"
+      ?"Nothing for this repo yet — conventions, invariants, whatever you keep re-explaining."
+      :"Nothing remembered yet — estimate patterns appear on their own as you finish tasks.";
     el.appendChild(p);
   }
   const row=document.createElement("div");row.className="row";
-  const inp=document.createElement("input");inp.type="text";
-  inp.placeholder="a fact worth remembering…";inp.style.flex="1";
+  const inp=document.createElement("input");inp.type="text";inp.style.flex="1";
+  inp.placeholder=scope==="project"?"a fact about this repo…":"a fact worth remembering…";
   row.appendChild(inp);
-  addBtn(row,"Remember",()=>{if(inp.value.trim())doMemory({action:"add",text:inp.value});});
-  if(m.disabled){
+  addBtn(row,"Remember",()=>{if(inp.value.trim())
+    doMemory({action:"add",scope:scope,text:inp.value});});
+  if(disabled){
     const note=document.createElement("span");note.className="muted";
-    note.textContent="adding a fact switches memory back on";row.appendChild(note);
-  }else addBtn(row,"Turn off (facts kept)",()=>doMemory({action:"off"}));
+    note.textContent="adding a fact switches it back on";row.appendChild(note);
+  }else addBtn(row,"Turn off (facts kept)",()=>doMemory({action:"off",scope:scope}));
   el.appendChild(row);
   const ed=document.createElement("details");ed.className="sub";
   ed.innerHTML="<summary>Edit all facts</summary>";
-  const ta=document.createElement("textarea");ta.value=m.facts.join("\n");
+  const ta=document.createElement("textarea");ta.value=facts.join("\n");
   ta.placeholder="one fact per line";ed.appendChild(ta);
   const erow=document.createElement("div");erow.className="row";
-  addBtn(erow,"Save facts",()=>doMemory({action:"edit",text:ta.value},
-    "Replace ALL stored facts with this list?"));
+  addBtn(erow,"Save facts",()=>doMemory({action:"edit",scope:scope,text:ta.value},
+    "Replace ALL facts in this section with this list?"));
   ed.appendChild(erow);el.appendChild(ed);
+}
+function renderMemory(m){
+  const el=document.getElementById("memoryBody"),
+    s=document.getElementById("memorySummary"),
+    p=m.project||{key:"?",facts:[],disabled:false};
+  const live=(m.disabled?0:m.facts.length+m.stats.length)
+    +(p.disabled?0:p.facts.length);
+  s.textContent=live?live+" reaching dump / break / draft":"nothing remembered yet";
+  el.innerHTML="";el.className="";
+  memorySection(el,"About you — everywhere","global",m.facts,m.stats,m.disabled);
+  memorySection(el,"In this project ("+p.key+")","project",p.facts,[],p.disabled);
 }
 // --- project
 async function loadProject(){
@@ -2737,6 +3011,9 @@ def main(argv=None):
     s.add_argument("action", nargs="?", default="show",
                    choices=["show", "add", "edit", "off"])
     s.add_argument("text", nargs="*", help="the fact, for `memory add`")
+    s.add_argument("--here", action="store_true",
+                   help="act on this repo's memory, not your global facts")
+    s.add_argument("--project", help="act on this project's memory, by profile name")
     s.set_defaults(fn=cmd_memory)
 
     s = sub.add_parser("project", help="teach AI features about this codebase")

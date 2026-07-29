@@ -377,6 +377,29 @@ check("memory off", code == 0 and "off" in out, out)
 run(["dump", "yet another thing"])
 check("memory off suppresses the suffix", "USER MEMORY" not in mock_llm.SEEN[-1])
 
+# --- memory: this repo's own facts, a scope of their own (global is OFF right now,
+# which is what proves the two are independent)
+code, out = run(["memory", "add", "never add a third-party dependency", "--here"])
+check("memory add --here scopes to the repo", code == 0 and "Remembered for" in out, out)
+check("project memory lands in its own file",
+      focus.memory_facts(focus.load_memory(focus.project_key()))
+      == ["never add a third-party dependency"])
+check("global memory left alone",
+      "third-party" not in json.dumps(focus.load_memory()))
+run(["dump", "something repo-shaped"])
+check("project memory reaches dump while global memory is off",
+      "In this project" in mock_llm.SEEN[-1] and "third-party" in mock_llm.SEEN[-1]
+      and "tiny first steps" not in mock_llm.SEEN[-1])
+run(["dump", "and again", "--no-project"])
+check("--no-project drops project memory too", "USER MEMORY" not in mock_llm.SEEN[-1])
+code, out = run(["memory", "show"])
+check("memory show lists both scopes",
+      "In this project" in out and "third-party" in out and "tiny first steps" in out, out)
+run(["memory", "off", "--here"])
+run(["dump", "back to nothing"])
+check("project memory off suppresses it as well",
+      "USER MEMORY" not in mock_llm.SEEN[-1])
+
 # --- a garbage model reply fails politely, not with a traceback
 real_chat = focus.chat
 focus.chat = lambda *a, **k: "sorry, thinking out loud, no json here"
@@ -485,6 +508,16 @@ m = json.loads(api("/api/memory", {"action": "edit", "text": "fact one\n\nfact t
 check("ui memory edit replaces facts", m["facts"] == ["fact one", "fact two"], m)
 m = json.loads(api("/api/memory", {"action": "off"})[1])
 check("ui memory off keeps facts", m["disabled"] is True and len(m["facts"]) == 2)
+m = json.loads(api("/api/memory", {"action": "add", "scope": "project",
+                                   "text": "diffs never leave the box"})[1])
+check("ui memory add scopes to the project",
+      "diffs never leave the box" in m["project"]["facts"]
+      and m["project"]["disabled"] is False
+      and m["facts"] == ["fact one", "fact two"] and m["disabled"] is True, m)
+m = json.loads(api("/api/memory", {"action": "off", "scope": "project"})[1])
+check("ui project memory off leaves the global scope alone",
+      m["project"]["disabled"] is True and len(m["project"]["facts"]) == 2
+      and m["disabled"] is True, m)
 
 # --- UI: voice show/setup/learn/edit/off (off is destructive — keep it last)
 v = json.loads(api("/api/voice", {"action": "show"})[1])
@@ -521,6 +554,32 @@ check("ui project edit saves",
 p = json.loads(api("/api/project", {"action": "off"})[1])
 check("ui project off clears",
       focus.load_project(focus.project_key()) == {} and p.get("fallback") is True, p)
+
+# --- UI: repo picker. MUST end back on this repo — everything below, and every project
+# lookup, resolves against the active root.
+REPO = os.path.dirname(HERE)
+r = json.loads(api("/api/repo", {"action": "show"})[1])
+check("ui repo show reports the active repo",
+      r["root"] == REPO and r["git"] is True, r)
+b = json.loads(api("/api/repo", {"action": "browse"})[1])
+check("ui repo browse lists this repo, flagged as git",
+      any(d["path"] == REPO and d["git"] for d in b["dirs"]), b)
+check("ui repo browse offers a way up", b["parent"] and b["parent"] != b["path"], b)
+check("ui repo use rejects a non-folder",
+      api_status("/api/repo", {"action": "use",
+                               "path": os.path.join(TMP, "nope")}) == 400)
+check("ui repo rejects a bad action", api_status("/api/repo", {"action": "wat"}) == 400)
+r = json.loads(api("/api/repo", {"action": "use", "path": TMP})[1])
+check("ui repo use switches root", r["root"] == TMP and r["git"] is False, r)
+check("ui repo use remembers it", focus.load_ui_prefs()["repo"] == TMP)
+check("ui repo use lists it as recent", any(x["path"] == TMP for x in r["recent"]), r)
+state = json.loads(api("/api/state")[1])
+check("state follows the picked repo",
+      state["root"] == TMP and state["repo"]["git"] is False, state["repo"])
+check("a non-repo folder still resolves a project key",
+      state["repo"]["key"] == focus.safe_name(os.path.basename(TMP)), state["repo"])
+r = json.loads(api("/api/repo", {"action": "use", "path": os.path.join(REPO, "tests")})[1])
+check("ui repo use on a subdirectory selects the repo", r["root"] == REPO, r)
 
 req = urllib.request.Request(
     f"http://127.0.0.1:{ui_port}/api/add",

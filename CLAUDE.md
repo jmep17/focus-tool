@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-python3 tests/test_focus.py           # the whole test suite (~114 checks, no pytest)
+python3 tests/test_focus.py           # the whole test suite (~173 checks, no pytest)
 uv tool install --editable .          # install `focus` on PATH, running this folder live
 uv run --script focus.py <subcommand> # run without installing (PEP 723 header, zero deps)
 focus doctor                          # check which local model server is reachable
@@ -31,8 +31,10 @@ header declares `dependencies = []`, which is what makes `uv run --script` and t
 
 **Storage** — plain JSON under `~/.focus/`, overridable with `FOCUS_HOME` (tests rely on
 this): `tasks.json` (`{next_id, tasks[]}`), `config.json` (`{endpoint, model}`),
-`voice.json`, `memory.json` (`{facts[], disabled?}`), `projects/<key>.json` per repo, and
-`pr/<name>.json` per review session. All writes go through `save_json`,
+`voice.json`, `memory.json` (`{facts[], disabled?}`), `memory/<key>.json` in the same shape
+for one repo's facts, `projects/<key>.json` per repo, `ui.json` (`{repo, recent[]}` — the
+dashboard's repo selection), and `pr/<name>.json` per review session. All writes go
+through `save_json`,
 which writes `.tmp` then `os.replace` for atomicity. `load_json` swallows missing/corrupt
 files and returns the default — there is no migration layer, so any new task field must be
 read with `.get()` (`started` and `completed` already follow this rule).
@@ -91,13 +93,24 @@ system prompt, and returns `""` when disabled or absent. It is invoked from both
 re-derives the whole profile from scratch each time.
 
 **User memory** — `memory_system_suffix()` follows the same contract (`""` when off or
-empty) and injects two things under the `USER MEMORY` marker: explicit `focus memory add`
-facts, and stats `memory_stats_lines()` derives *deterministically* from `history.jsonl`
-(median estimate-vs-actual ratio after 3 samples, finishing streak). No model round-trip
-in the derivation — that's the point; it works with no server running. Injected into
-dump/break/draft and their UI twins only, never `pr`: the pr budget belongs to the diff.
-`actual_min` is capped at 8h in `actual_minutes()` so a task started Monday and finished
-Friday doesn't poison calibration.
+empty) and injects three things under the one `USER MEMORY` marker: explicit `focus memory
+add` facts, stats `memory_stats_lines()` derives *deterministically* from `history.jsonl`
+(median estimate-vs-actual ratio after 3 samples, finishing streak), and — under an
+`In this project (<key>):` line — the active repo's own facts from `memory/<key>.json`.
+No model round-trip in the derivation — that's the point; it works with no server running.
+Injected into dump/break/draft and their UI twins only, never `pr`: the pr budget belongs
+to the diff. `actual_min` is capped at 8h in `actual_minutes()` so a task started Monday
+and finished Friday doesn't poison calibration.
+
+The two memory scopes are independent — each file has its own `disabled` flag, and
+`memory_path(key=None)` is the only thing that knows which is which. The stats stay global
+on purpose: `history.jsonl` carries no repo, and how far someone's estimates run out is a
+fact about the person. Project facts are `_clip`ped first and capped at half of
+`MAX_MEMORY_CHARS` so a long global list can't crowd out the specific ones. `--no-project`
+(and the UI's `no_project`) drops the project block along with the project profile — one
+flag, one meaning. CLI scope flags trail the text, as everywhere else here:
+`focus memory add "<fact>" --here`, since argparse can't take a flag between two
+positionals.
 
 **Project context** — `project_system_suffix()` appends a repo profile to *every* AI system
 prompt (dump, break, pr, draft, and their UI twins), the same shape as the voice suffix.
@@ -119,8 +132,18 @@ budget by `len(ctx)`). An 8k-context model is already over budget on diff alone;
 that grows the request is a regression. `_clip()` exists so a heading-less doc or one
 oversized section can't blow the budget and silently eat the diff's share.
 
-`_ROOT_CACHE` memoises the two `git` shell-outs per cwd — `api_state()` resolves context on
-every dashboard poll.
+**Which repo is "here" is `active_root()`.** `_root_and_key()` resolves against it, so
+`project_root()`, `project_key()`, `resolve_project_context()` and everything downstream
+follow one variable. `_ACTIVE_ROOT` is `None` for the CLI — that's the whole reason CLI
+behaviour is unchanged — and is set only by the dashboard's repo picker via
+`set_active_root()`, which resolves a subdirectory to its toplevel, rejects non-directories
+with `ValueError`, and drops the `_ROOT_CACHE` entry so re-selecting re-probes. Don't
+reintroduce a bare `os.getcwd()` in that path. `git_working_diff(root)` takes the root
+explicitly because it is a `subprocess` cwd, not a lookup.
+
+`_ROOT_CACHE` memoises the two `git` shell-outs per root — `api_state()` resolves context on
+every dashboard poll. Keep that poll cheap: `repo_state()` only builds the recent-repos list
+when the picker asks (`recent=True`), never for `/api/state`.
 
 **Task lifecycle goes through `complete_task()`** — it stamps `completed`, ticks
 subtasks, and logs the `done` event, and it is shared by `cmd_done`, `cmd_move`,
@@ -140,9 +163,16 @@ server stays up. `do_POST` rejects requests whose `Host`/`Origin` isn't local
 don't remove the check when adding endpoints.
 
 Feature areas each get one multiplexed POST route dispatching on an `action` field
-(`/api/pr`, `/api/triage`, `/api/memory`, `/api/voice`, `/api/project`), mirroring the
-CLI's verbs; panel bodies lazy-load via `action: "show"` on open, and nothing heavy (pr
-sessions, profile text, `repo_brief`) is ever added to the 5-second `/api/state` poll.
+(`/api/pr`, `/api/triage`, `/api/memory`, `/api/voice`, `/api/project`, `/api/repo`),
+mirroring the CLI's verbs; panel bodies lazy-load via `action: "show"` on open, and nothing
+heavy (pr sessions, profile text, `repo_brief`, the repo picker's directory listing) is ever
+added to the 5-second `/api/state` poll.
+
+`/api/repo` (`show` / `browse` / `use`) is the picker, and the only writer of `_ACTIVE_ROOT`.
+It is a POST route so `_origin_ok` covers it — a filesystem listing must not be reachable by
+a cross-origin form post. `browse` is a `os.listdir` plus one `.git` stat per entry, never a
+shell-out. After `use`, the page reloads the project and memory panels if they're open;
+both describe the repo and go stale otherwise.
 The UI must never call `get_diff()` — its stdin tier blocks a server thread forever;
 `git_working_diff()` is the UI-safe extraction, just as `run_pr_review()` /
 `_latest_session_path()` are the print-free, SystemExit-free cores shared with `cmd_pr`.

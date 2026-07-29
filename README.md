@@ -166,20 +166,30 @@ Best loop: when a draft sounds off, fix it by hand, send it, then
 
 ```bash
 focus memory add "I underestimate anything involving other people's code"
-focus memory show      # everything the AI is told about you
+focus memory add "never add a third-party dependency" --here   # this repo only
+focus memory show      # everything the AI is told about you, both scopes
 focus memory edit      # rewrite the facts in $EDITOR
 focus memory off       # stop injecting (facts kept); --no-memory skips one command
+focus memory off --here                    # …just this repo's facts
+focus memory add "…" --project acme-api    # another repo's, by profile name
 ```
 
-Two kinds of memory reach the model. **Facts you add** — standing truths about how
+Three kinds of memory reach the model. **Facts you add** — standing truths about how
 you work. **Patterns focus derives on its own** from `~/.focus/history.jsonl`, the
 local event log every command appends to: once three finished tasks have both an
 estimate and an actual, it computes how far off your guesses run and tells the model
 to size estimates accordingly ("real tasks take ~2.1x the guess"). Derivation is
-deterministic — no model round-trip, so it works even with no server running, and
-it's injected as a short `USER MEMORY` suffix into `dump`, `break` and `draft`
-(not `pr`, whose context budget belongs to the diff). Like everything else, the log
-and the facts are plain JSON on your machine.
+deterministic — no model round-trip, so it works even with no server running. And
+**facts about one repo**, added with `--here`: the conventions you keep re-explaining,
+which reach the model only while you're in that repo, under an `In this project (…)`
+line. The two scopes are separate files with separate off switches — turning global
+memory off doesn't silence a repo's own facts, and `--no-project` drops the repo's
+facts along with its profile.
+
+It all goes in as one short `USER MEMORY` suffix on `dump`, `break` and `draft`
+(not `pr`, whose context budget belongs to the diff), capped so repo facts can't be
+crowded out by a long global list. Like everything else, the log and the facts are
+plain JSON on your machine.
 
 ### "The advice doesn't know my codebase" → `focus project`
 
@@ -209,7 +219,8 @@ repo's own `CLAUDE.md` (or whichever doc it finds) live. `focus project` just
 distils that into something smaller and sharper. Resolution order:
 
 1. `--project NAME` — an explicit profile, for when the diff arrives on stdin and
-   you're sitting in a different directory
+   you're sitting in a different directory (in the dashboard, point the repo bar at
+   the folder instead)
 2. `~/.focus/projects/<repo>.json` — what `focus project` built
 3. `.focus/project.md` **committed in your repo** — the way to share one reviewed
    context file with your team; focus reads it and never writes there
@@ -247,6 +258,15 @@ streak, an Inbox/Now/Next/Later board with tick-able subtasks, breadcrumb notes
 and age badges on stale cards, a brain-dump box and a message drafter. The API
 rejects requests from other origins, so a random webpage can't poke your tasks.
 
+**It follows whichever repo you're in.** The bar at the top shows the current one;
+**change** opens a folder picker — browse, paste a path, or click one you've used
+before, with git repos flagged. Everything repo-shaped follows the choice: which
+diff **Review changes in …** picks up, which project profile is appended to every
+prompt, and which project memory the Memory panel edits. The choice is remembered,
+so the dashboard reopens where you left it — the CLI is unaffected and stays
+wherever you're `cd`'d to. Browsing never leaves the machine; it's the same local
+server that was already reading your repo.
+
 ### Everyday plumbing
 
 ```bash
@@ -274,7 +294,7 @@ focus move 4 later   # inbox / now / next / later
 ## Testing / hacking
 
 ```bash
-python3 tests/test_focus.py   # 114 end-to-end checks against a mock model
+python3 tests/test_focus.py   # 173 end-to-end checks against a mock model
 ```
 
 Single file, MIT-style — change anything. Prompts live near the top of `focus.py`
@@ -286,7 +306,10 @@ them to your taste; that's half the fun.
 - Talks only to `127.0.0.1` (your model server). The UI binds to `127.0.0.1`
   and refuses cross-origin requests. Timer notifications use local `osascript`.
 - Data: plain JSON under `~/.focus/` — tasks, the `history.jsonl` event log,
-  memory facts, voice and project profiles. Delete the folder, it's gone.
+  memory facts (global and per-repo), voice and project profiles, and which repo
+  the dashboard was last pointed at. Delete the folder, it's gone.
+- The dashboard's folder picker lists directories on your machine to a page served
+  from `127.0.0.1`, and nowhere else. Nothing is uploaded, indexed or phoned home.
 - Diffs, drafts, memory facts, and anything `focus project` harvests from your
   repo (docs, manifests, file tree, commit history) are sent to your local model
   only. On a work machine, that's the whole point.
