@@ -164,6 +164,45 @@ messy = 'Sure! Here you go:\n```json\n{"a": {"b": "brace } in string"}, "c": 1}\
 check("extract_json handles fences+nesting",
       focus.extract_json(messy) == {"a": {"b": "brace } in string"}, "c": 1})
 
+# --- streaming: deltas land as they come, and survive servers that won't stream
+deltas = []
+text = focus.chat(focus.SYS_PR, "a diff", on_delta=deltas.append)
+check("chat streams in more than one piece", len(deltas) > 1, len(deltas))
+check("each delta is the reply so far", deltas[-1] == text and "retry logic" in text)
+check("deltas only grow", all(len(a) < len(b) for a, b in zip(deltas, deltas[1:])))
+check("partial summary reads a half-written reply",
+      focus._partial_summary('{"summary": "Adds retr') == "Adds retr")
+check("partial summary survives a cut escape",
+      focus._partial_summary('{"summary": "Adds \\u00') == "Adds \\u00")
+check("partial summary unescapes what it can",
+      focus._partial_summary('{"summary": "Adds \\"retry\\" logic') == 'Adds "retry" logic')
+check("partial summary is empty before the field lands", focus._partial_summary('{"su') == "")
+for mode, name in (("plain", "a server that ignores stream still answers"),
+                   ("error", "a server that refuses to stream falls back")):
+    os.environ["FOCUS_TEST_NOSTREAM"] = mode
+    check(name, "retry logic" in focus.chat(focus.SYS_PR, "a diff", on_delta=lambda t: None))
+del os.environ["FOCUS_TEST_NOSTREAM"]
+
+# --- pr progress: piped prints once per stage, a tty rewrites one live line
+code, out = run(["pr", "-f", diff_path, "--name", "prog-pr"])
+check("pr says it is asking the model", "asking the model" in out, out)
+check("pr reports the diff it sent", "· diff: " in out, out)
+
+class _FakeTTY(io.StringIO):
+    def isatty(self):
+        return True
+
+tty = _FakeTTY()
+p = focus.pr_progress_printer(tty)
+p("context", "CLAUDE.md (12 chars)")
+p("model", "")
+p("model", '{"summary": "Adds retry logic to the payment client')
+p("saved", "prog-pr")
+drawn = tty.getvalue()
+check("tty progress rewrites one live line",
+      "\r" in drawn and drawn.count("\n") == 1, repr(drawn[-80:]))
+check("tty progress shows the summary as it arrives", "Adds retry logic" in drawn, drawn)
+
 # --- UI API round-trip
 import threading
 ui_server = focus.ThreadingHTTPServer(("127.0.0.1", 0), focus.UIHandler)
@@ -505,6 +544,11 @@ s_pr = json.loads(body)
 check("ui pr review summarises",
       "retry logic" in s_pr["summary"] and len(s_pr["checklist"]) == 2, s_pr)
 check("ui pr session saved", os.path.exists(focus.pr_session_path("ui-pr")))
+prog = json.loads(api("/api/pr", {"action": "progress"})[1])
+check("ui pr progress ends inactive",
+      prog["active"] is False and prog["stage"] == "saved", prog)
+check("ui pr progress tracked the model",
+      prog["summary"].startswith("Adds retry logic") and prog["elapsed"] >= 0, prog)
 check("pr never carries user memory", "USER MEMORY" not in mock_llm.SEEN[-1])
 status, body = api("/api/pr", {"action": "check", "n": 1, "name": "ui-pr"})
 check("ui pr check ticks", json.loads(body)["checklist"][0]["done"] is True)

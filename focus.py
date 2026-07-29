@@ -171,17 +171,56 @@ def detect_runtime():
         "  Non-AI commands (add, ls, next, done, move) work without one."
     )
 
-def chat(system, user, temperature=0.3):
+def chat(system, user, temperature=0.3, on_delta=None):
     name, base, model = detect_runtime()
-    resp = http_json(base + "/chat/completions", {
+    payload = {
         "model": model,
         "temperature": temperature,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-    })
+    }
+    if on_delta is not None:
+        # Streaming is a display nicety, never a new failure mode. A server that refuses
+        # `stream`, or streams nothing usable, falls through to the plain request below —
+        # the caller gets the same string it always got, just later.
+        try:
+            text = _chat_stream(base + "/chat/completions", payload, on_delta)
+            if text.strip():
+                return text
+        except (OSError, ValueError, KeyError):
+            pass
+    resp = http_json(base + "/chat/completions", payload)
     return resp["choices"][0]["message"]["content"]
+
+def _chat_stream(url, payload, on_delta):
+    """Read an OpenAI-shaped SSE stream, calling on_delta(text so far) as each piece
+    lands, and return the whole reply. Tolerates a server that ignores `stream` and
+    answers with one plain JSON body: that arrives as a single line with a `message`
+    rather than a `delta`, and is read the same way."""
+    data = json.dumps(dict(payload, stream=True)).encode()
+    req = urllib.request.Request(url, data=data, headers={
+        "Content-Type": "application/json", "Accept": "text/event-stream"})
+    parts = []
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        for raw in resp:                      # one line at a time, as the socket gives it
+            line = raw.decode("utf-8", "replace").strip()
+            if line.startswith("data:"):
+                line = line[5:].strip()
+            if not line or line == "[DONE]":
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:                # keep-alive comments, framing noise
+                continue
+            for ch in obj.get("choices", []):
+                piece = ((ch.get("delta") or {}).get("content")
+                         or (ch.get("message") or {}).get("content") or "")
+                if piece:
+                    parts.append(piece)
+                    on_delta("".join(parts))
+    return "".join(parts)
 
 def extract_json(text):
     """Pull the first JSON object out of a model reply, tolerating chatter/fences."""
@@ -210,18 +249,33 @@ def extract_json(text):
                     return json.loads(text[start:i + 1])
     raise ValueError("unterminated JSON object in model reply")
 
+_SUMMARY_RE = re.compile(r'"summary"\s*:\s*"((?:[^"\\]|\\.)*)')
+
+def _partial_summary(text):
+    """The `summary` field out of a *half-written* JSON reply, for live progress. The
+    reply can't be parsed yet — extract_json needs a closed object — so this reads the
+    one field worth watching appear, and returns "" until it starts."""
+    m = _SUMMARY_RE.search(text)
+    if not m:
+        return ""
+    try:
+        return json.loads('"' + m.group(1) + '"')
+    except ValueError:                        # cut mid-escape; show it raw this frame
+        return m.group(1)
+
 class ModelReplyError(RuntimeError):
     pass
 
-def ask_model(system, user, temperature=0.3, raw=False):
+def ask_model(system, user, temperature=0.3, raw=False, on_delta=None):
     """One model call with one retry. raw=True returns the reply text; otherwise the
     first JSON object in it. Garbage replies and HTTP failures become ModelReplyError
     so callers never traceback on a flaky local model. NoModelError passes through —
-    it has its own fallbacks."""
+    it has its own fallbacks. on_delta(text so far) streams the reply as it is written;
+    on the retry it simply starts again from the empty string."""
     last = None
     for _ in range(2):
         try:
-            reply = chat(system, user, temperature)
+            reply = chat(system, user, temperature, on_delta=on_delta)
             return reply if raw else extract_json(reply)
         except NoModelError:
             raise
@@ -1674,26 +1728,39 @@ def _pr_preamble(meta):
     return "\n".join(x for x in (head, line, body) if x) + "\n\nDIFF:\n"
 
 def run_pr_review(diff, source, name=None, project=None, no_project=False,
-                  pr_meta=None, story=None, no_ticket=False):
+                  pr_meta=None, story=None, no_ticket=False, progress=None):
     """Resolve context, charge it against the diff budget, ask the model, save the
-    session. Shared by cmd_pr and the UI's /api/pr — never prints, never SystemExits."""
+    session. Shared by cmd_pr and the UI's /api/pr — never prints, never SystemExits.
+
+    progress(stage, text) is called as the review happens: "context"/"ticket"/"diff"
+    with a human-readable line, then "model" repeatedly with the raw reply so far (the
+    caller renders what it likes from it), then "saved". A review is the one command
+    that can sit silent for a minute — this is what says it is still going."""
+    say = progress or (lambda stage, text="": None)
     # Resolve context first, then charge it to the diff's budget so the request never
     # grows. Keyed on the paths the diff touches, so only relevant sections survive.
     ctx, ctx_source = resolve_project_context(
         diff_paths(diff), budget=MAX_CONTEXT_CHARS, name=project, disabled=no_project)
+    if ctx:
+        say("context", f"{ctx_source} ({len(ctx)} chars)")
     # The ticket is the one thing a diff can't tell you: what it was *asked* to do. This
     # is the only injection site that refreshes over the network — a review is already a
     # deliberate, slow act, and a stale acceptance criterion is worse here than anywhere.
     ticket, ticket_info = resolve_ticket_context(
         budget=MAX_TICKET_CHARS, story=story, disabled=no_ticket, pr_meta=pr_meta,
         refresh=True)
+    if ticket_info:
+        say("ticket", f"sc-{ticket_info['id']} {ticket_info.get('name', '')}".strip())
     preamble = _pr_preamble(pr_meta)
     truncated = False
     budget = MAX_DIFF_CHARS - len(ctx) - len(ticket) - len(preamble)
     if len(diff) > budget:
         diff = diff[:budget]
         truncated = True
-    data = ask_model(SYS_PR + project_block(ctx) + ticket_block(ticket), preamble + diff)
+    say("diff", f"{len(diff)} chars from {source}" + (" (truncated)" if truncated else ""))
+    say("model", "")            # the wait starts here, before the first token lands
+    data = ask_model(SYS_PR + project_block(ctx) + ticket_block(ticket), preamble + diff,
+                     on_delta=lambda text: say("model", text))
     name = name or (f"pr-{pr_meta['number']}" if pr_meta
                     else datetime.now().strftime("pr-%Y%m%d-%H%M"))
     session = {
@@ -1714,7 +1781,83 @@ def run_pr_review(diff, source, name=None, project=None, no_project=False,
         ],
     }
     save_json(pr_session_path(name), session)
+    say("saved", name)
     return session
+
+_SPIN = "|/-\\"
+_STAGE_LABEL = {"context": "context", "ticket": "ticket", "diff": "diff"}
+
+def _term_width(stream):
+    """Columns to draw the live line in. A pty with no window size set — CI, some ssh
+    sessions — answers 0, which would clip every frame by a character and pad the clear
+    with nothing, so anything implausible falls back to 80."""
+    try:
+        cols = os.get_terminal_size(stream.fileno()).columns
+    except Exception:
+        cols = 0
+    return cols if cols >= 20 else 80
+
+def pr_progress_printer(stream=None):
+    """A run_pr_review progress callback that shows the review happening on stderr: one
+    line per resolved input, then a live line the summary writes itself into as the model
+    produces it. On a tty a ticker thread repaints that line, so the silence *before* the
+    first token still moves; piped, each stage prints once and nothing rewrites."""
+    stream = stream or sys.stderr
+    try:
+        tty = stream.isatty()
+    except Exception:
+        tty = False
+    lock = threading.Lock()
+    st = {"text": "", "start": time.time(), "stop": None, "thread": None, "said": False}
+
+    def paint():
+        secs = int(time.time() - st["start"])
+        tail = _partial_summary(st["text"]) or (
+            f"{len(st['text'])} chars in" if st["text"] else "thinking")
+        frame = _SPIN[int(time.time() * 5) % len(_SPIN)]
+        width = _term_width(stream) - 1
+        with lock:
+            if st["thread"] is None:
+                return
+            stream.write("\r" + f"  {frame} reading the diff… {secs}s · {tail}"[:width]
+                         .ljust(width))
+            stream.flush()
+
+    def tick():
+        while not st["stop"].wait(0.2):
+            paint()
+
+    def stop_ticker():
+        if st["thread"] is None:
+            return
+        st["stop"].set()
+        st["thread"].join(timeout=1)
+        with lock:
+            st["thread"] = None
+            stream.write("\r" + " " * (_term_width(stream) - 1) + "\r")
+            stream.flush()
+
+    def progress(stage, text=""):
+        if stage == "model":
+            st["text"] = text
+            if not tty:
+                if not st["said"]:
+                    st["said"] = True
+                    stream.write("  · asking the model (this is the slow bit)…\n")
+                    stream.flush()
+                return
+            if st["thread"] is None:
+                st["start"], st["stop"] = time.time(), threading.Event()
+                st["thread"] = threading.Thread(target=tick, daemon=True)
+                st["thread"].start()
+            paint()
+            return
+        stop_ticker()
+        if stage in _STAGE_LABEL:
+            stream.write(f"  · {_STAGE_LABEL[stage]}: {text}\n")
+            stream.flush()
+
+    return progress
 
 def cmd_pr(args):
     action, item = _pr_action(args)
@@ -1732,7 +1875,8 @@ def cmd_pr(args):
         diff, source, pr_meta = get_diff(args)
     session = run_pr_review(diff, source, name=args.name, project=args.project,
                             no_project=args.no_project, pr_meta=pr_meta,
-                            story=args.story, no_ticket=args.no_ticket)
+                            story=args.story, no_ticket=args.no_ticket,
+                            progress=pr_progress_printer())
     print_pr(session)
     print(f"Saved as '{session['name']}'. After any interruption: focus pr resume")
 
@@ -2166,6 +2310,41 @@ def shortcut_state():
         "pins": repo.get("branches") or {},
     }
 
+# One slot, not a registry: the dashboard is one person in one browser, and a second
+# concurrent review would only be overwriting the line the first one is drawing. The
+# review POST blocks for a minute, so progress rides a separate poll on another thread
+# rather than the response body — no streaming socket to keep alive, nothing added to
+# /api/state, and a reloaded page can still find the review it left running.
+_PR_PROGRESS = {"active": False, "stage": "", "text": "", "chars": 0, "summary": "",
+                "started": 0.0}
+_PR_PROGRESS_LOCK = threading.Lock()
+
+def ui_pr_progress(stage, text=""):
+    """run_pr_review's progress callback for the dashboard: keep the latest state, let
+    the page ask for it. The model stage carries the raw half-written reply, so the
+    summary is pulled out here and the page renders words rather than JSON."""
+    with _PR_PROGRESS_LOCK:
+        _PR_PROGRESS.update(active=True, stage=stage)
+        if stage == "model":
+            _PR_PROGRESS.update(chars=len(text), summary=_partial_summary(text), text="")
+        else:
+            _PR_PROGRESS["text"] = text
+
+def pr_progress_begin(stage, text=""):
+    with _PR_PROGRESS_LOCK:
+        _PR_PROGRESS.update(active=True, stage=stage, text=text, chars=0, summary="",
+                            started=time.time())
+
+def pr_progress_end():
+    with _PR_PROGRESS_LOCK:
+        _PR_PROGRESS["active"] = False
+
+def pr_progress_state():
+    with _PR_PROGRESS_LOCK:
+        s = dict(_PR_PROGRESS)
+    s["elapsed"] = int(time.time() - s["started"]) if s["started"] else 0
+    return s
+
 def browse_dirs(path):
     """Subdirectories of `path`, for the repo picker. Raises OSError if unreadable.
     `git` is a stat rather than a shell-out — this runs once per listed folder."""
@@ -2576,12 +2755,18 @@ class UIHandler(BaseHTTPRequestHandler):
                 self._send(200, shortcut_state())
             elif self.path == "/api/pr":
                 action = body.get("action", "review")
+                if action == "progress":
+                    # Polled from the page *while* a review POST is still blocking on
+                    # another thread. Cheap by construction: one dict copy, no I/O.
+                    return self._send(200, pr_progress_state())
                 if action in ("review", "fetch"):
                     pr_meta = None
+                    pr_progress_begin("fetch" if action == "fetch" else "diff")
                     if action == "fetch":
                         diff, pr_meta, reason = gh_pr_diff(project_root(),
                                                            body.get("n") or None)
                         if not diff:
+                            pr_progress_end()
                             return self._send(400, {"error": reason})
                         source = pr_source(pr_meta)
                     else:
@@ -2592,16 +2777,23 @@ class UIHandler(BaseHTTPRequestHandler):
                         if not diff.strip():
                             diff, source = git_working_diff(project_root())
                             if not diff:
+                                pr_progress_end()
                                 return self._send(400, {"error":
                                     "No diff. Paste one, stage changes in "
                                     + project_root()
                                     + ", or use Review this branch's PR."})
-                    session = run_pr_review(
-                        diff, source, name=body.get("name") or None,
-                        project=body.get("project") or None,
-                        no_project=body.get("no_project", False), pr_meta=pr_meta,
-                        story=body.get("story") or None,
-                        no_ticket=body.get("no_ticket", False))
+                    try:
+                        session = run_pr_review(
+                            diff, source, name=body.get("name") or None,
+                            project=body.get("project") or None,
+                            no_project=body.get("no_project", False), pr_meta=pr_meta,
+                            story=body.get("story") or None,
+                            no_ticket=body.get("no_ticket", False),
+                            progress=ui_pr_progress)
+                    finally:
+                        # However this ends — reply, dead model, raised error — the poll
+                        # has to stop saying a review is running.
+                        pr_progress_end()
                     return self._send(200, session)
                 if action not in ("resume", "check"):
                     return self._send(400, {"error": "bad action"})
@@ -3095,7 +3287,31 @@ function renderTriage(){
   }
 }
 // --- pr review
-let prName=null;
+// The review POST blocks for as long as the model takes, so progress comes from a second
+// request on another server thread rather than the response body — and the summary shows
+// up word by word as the model writes it, which is the bit that says it's alive.
+let prName=null,prPoll=null;
+function prProgressText(p){
+  if(!p||!p.active)return "";
+  const t=" · "+p.elapsed+"s";
+  if(p.stage==="fetch")return "fetching the pull request…"+t;
+  if(p.stage==="context")return "project context: "+p.text+t;
+  if(p.stage==="ticket")return "ticket "+p.text+t;
+  if(p.stage==="model")
+    return (p.summary?"reading the diff: "+p.summary:"reading the diff…")+t;
+  if(p.stage==="saved")return "";
+  return p.text+t;
+}
+function stopPrPoll(){if(prPoll){clearInterval(prPoll);prPoll=null;}}
+function startPrPoll(){
+  stopPrPoll();
+  prPoll=setInterval(async()=>{
+    try{
+      const txt=prProgressText(await api("/api/pr",{action:"progress"}));
+      if(txt)document.getElementById("prStatus").textContent=txt;
+    }catch(e){}
+  },700);
+}
 async function doPr(mode){
   const s=document.getElementById("prStatus");
   const body={action:mode==="resume"?"resume":(mode==="fetch"?"fetch":"review"),
@@ -3110,10 +3326,12 @@ async function doPr(mode){
     body.no_ticket=document.getElementById("prNoTicket").checked;
     s.textContent=mode==="fetch"?"fetching the PR, then reviewing…"
       :"reviewing… (local models take a minute)";
+    startPrPoll();
   }
   try{const r=await api("/api/pr",body);s.textContent="";renderPr(r);
     document.getElementById("prOut").scrollIntoView({behavior:"smooth",block:"nearest"});}
   catch(e){s.textContent=e.message;}
+  finally{stopPrPoll();}
 }
 async function prCheck(n){
   try{renderPr(await api("/api/pr",{action:"check",n:n,name:prName}));}

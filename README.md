@@ -133,6 +133,12 @@ The model writes a 3-sentence summary, flags where to look hardest, and builds
 a file-by-file checklist. Your position is saved on disk, so a meeting or a
 Slack ping can't wipe your mental state — the checklist *is* the state.
 
+A review on a local model takes a minute, so it tells you what it's doing while
+it does it: what context and ticket it found, how much diff it sent, then a live
+line where the summary writes itself out a few words at a time. The dashboard
+shows the same thing under the Review button. Piped or redirected, it prints one
+plain line per step instead of animating.
+
 You don't have to find the diff yourself. With nothing staged, `focus pr` asks
 your own `gh` for the pull request on the branch you're standing on, names the
 session after it (`pr-4521`), and puts the PR's title and description in front of

@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-python3 tests/test_focus.py           # the whole test suite (~233 checks, no pytest)
+python3 tests/test_focus.py           # the whole test suite (~249 checks, no pytest)
 uv tool install --editable .          # install `focus` on PATH, running this folder live
 uv run --script focus.py <subcommand> # run without installing (PEP 723 header, zero deps)
 focus doctor                          # check which local model server is reachable
@@ -61,6 +61,13 @@ Studio (`:1234`), then Ollama (`:11434`), and picks the first model id it sees u
 and braces inside strings — small local models produce all three, so use it rather than
 `json.loads` on any model reply. Failure to find a server raises `NoModelError`, which
 `main()` turns into exit code 2; only `dump` degrades gracefully (one line = one task).
+
+`chat(on_delta=...)` streams: `_chat_stream` posts `"stream": true` and reads the SSE
+lines as the socket gives them, calling `on_delta(text so far)`. Streaming is a **display
+nicety, never a new failure mode** — a server that refuses `stream`, or one that answers
+it with a plain JSON body, falls back to the ordinary request and the caller gets the
+same string it always got. Don't turn a streaming failure into an error; the two mock
+servers behind `FOCUS_TEST_NOSTREAM` (`plain` / `error`) exist to keep that true.
 
 Every AI call site goes through `ask_model()` — chat + extract_json with one retry, and
 any garbage reply or HTTP failure surfaced as `ModelReplyError` (exit 2 in the CLI, 502
@@ -198,6 +205,25 @@ rather than collapsing failures to `""`: an explicit `focus pr fetch` has to be 
 but `focus pr` and must not sit there for a minute × two `gh` invocations. When a PR is
 found its title and body ride ahead of the diff in the user message (`_pr_preamble`) —
 cheap, high-signal context the author already wrote.
+
+**A review says it is working.** `run_pr_review(progress=...)` emits `context` / `ticket` /
+`diff` with a human-readable line, then `model` repeatedly with the **raw half-written
+reply** — each consumer renders what it wants from it, which is why `_partial_summary()`
+(a regex over an unparseable prefix, not `extract_json`) is a shared helper rather than
+living in either renderer. The `model` stage fires once with `""` *before* `ask_model`, so
+both renderers know the wait has started before the first token lands.
+
+`pr_progress_printer()` is the CLI's: static lines, then a live line repainted by a ticker
+thread so the silence before the first token still moves. It checks `isatty()` — piped, it
+prints `asking the model…` once and never rewrites, which is also what the test suite sees
+(it captures stderr into a `StringIO`). `_term_width` floors an implausible width at 80: a
+pty with no winsize reports 0, which silently clipped every frame by a character.
+
+The dashboard's is a **poll, not a stream**: `_PR_PROGRESS` is one slot (one person, one
+browser) that `ui_pr_progress` writes and `/api/pr` `action: "progress"` reads, so the page
+can ask on another thread while the review POST blocks. That keeps the response shape
+unchanged, adds nothing to `/api/state`, and needs no long-lived socket. `pr_progress_end()`
+belongs in a `finally` — a dead model must not leave the page saying a review is running.
 
 **The dashboard has no implicit PR tier.** `/api/pr` `review` is paste → working tree →
 400; pulling a PR is the separate `fetch` action behind its own button. `gh` is two

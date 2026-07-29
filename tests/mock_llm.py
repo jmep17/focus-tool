@@ -1,5 +1,6 @@
 """Mock OpenAI-compatible server so tests run without a real local model."""
 import json
+import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -79,6 +80,24 @@ class MockHandler(BaseHTTPRequestHandler):
         SEEN.append(payload["messages"][0]["content"])
         SEEN_USER.append(payload["messages"][-1]["content"])
         content = canned_reply(payload["messages"])
+        # FOCUS_TEST_NOSTREAM stands in for the two servers focus has to survive: one that
+        # answers a stream request with a plain body ("plain"), and one that refuses it
+        # outright ("error"). Anything else streams SSE, like LM Studio and Ollama do.
+        nostream = os.environ.get("FOCUS_TEST_NOSTREAM", "")
+        if payload.get("stream") and nostream == "error":
+            self.send_response(400)
+            self.end_headers()
+            return
+        if payload.get("stream") and not nostream:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            for i in range(0, len(content), 40):     # several pieces, like a real model
+                chunk = {"choices": [{"delta": {"content": content[i:i + 40]}}]}
+                self.wfile.write(b"data: " + json.dumps(chunk).encode() + b"\n\n")
+                self.wfile.flush()
+            self.wfile.write(b"data: [DONE]\n\n")
+            return
         body = json.dumps({"choices": [{"message": {"role": "assistant",
                                                     "content": content}}]}).encode()
         self.send_response(200)
